@@ -29,7 +29,7 @@ IDLE_LOOP = 30
 STEAM_WINDOW_START = 1800     # T-30min
 STEAM_WINDOW_END = 60         # T-1min
 STEAM_DROP_PCT = 0.20         # drop must be MORE than 20%
-MAX_ALERT_ODDS = 20.0         # alert only if current odds BELOW this
+MAX_ALERT_ODDS = 20.0         # alert fires only once current odds are BELOW this
 SEEN_TTL_SECONDS = 86400
 STATE_FILE = os.environ.get("STATE_FILE", "steam_state.json")
 UK_TZ = ZoneInfo("Europe/London")
@@ -41,6 +41,7 @@ ALLOWED_COUNTRIES = {
 
 steam_baseline = {}
 steam_alerted = {}
+pending_logged = set()   # runners already logged as pending (log once, not every 5s)
 event_seen = {}
 
 
@@ -110,6 +111,7 @@ def purge_stale():
     for r in [r for r, v in steam_baseline.items()
               if now > v.get("race_epoch", now) + 600]:
         steam_baseline.pop(r, None)
+        pending_logged.discard(r)
     for r in [r for r, t in steam_alerted.items()
               if now - t > SEEN_TTL_SECONDS]:
         steam_alerted.pop(r, None)
@@ -218,7 +220,7 @@ def send_coverage_audit():
 # ---------- core ----------
 def scan(warmup=False):
     steams = races_in_window = runners_tracked = skipped_country = 0
-    skipped_longshot = 0
+    pending_count = 0
     next_window_in = None
 
     try:
@@ -321,13 +323,15 @@ def scan(warmup=False):
                 if mid >= base["mid"] * (1 - STEAM_DROP_PCT):
                     continue
 
-                # --- NEW: odds cap at notification time ---
+                # --- PENDING behaviour: >20% dropper still at 20+ stays
+                # armed; fires the moment it dips below MAX_ALERT_ODDS ---
                 if mid >= MAX_ALERT_ODDS:
-                    steam_alerted[rid] = now_epoch  # mute; still a longshot
-                    skipped_longshot += 1
-                    log(f"SKIPPED (odds {mid:.1f} >= {MAX_ALERT_ODDS:.0f}): "
-                        f"{rname} @ {event_name} "
-                        f"{base['mid']:.2f}->{mid:.2f}")
+                    pending_count += 1
+                    if rid not in pending_logged:
+                        pending_logged.add(rid)
+                        log(f"PENDING (odds {mid:.1f} >= "
+                            f"{MAX_ALERT_ODDS:.0f}, armed): {rname} @ "
+                            f"{event_name} {base['mid']:.2f}->{mid:.2f}")
                     continue
 
                 if warmup:
@@ -342,6 +346,7 @@ def scan(warmup=False):
                     f"T-{mins_to_off}m")
                 if send_telegram(msg):
                     steam_alerted[rid] = now_epoch
+                    pending_logged.discard(rid)
                     steams += 1
                     save_state()
 
@@ -353,7 +358,7 @@ def scan(warmup=False):
 
     purge_stale()
     log(f"in_window_races={races_in_window} tracked={runners_tracked} "
-        f"skipped_country={skipped_country} skipped_longshot={skipped_longshot} "
+        f"skipped_country={skipped_country} pending={pending_count} "
         f"events_today={inc_count}✅/{exc_count}🚫 "
         f"baselines={len(steam_baseline)} alerts={steams}")
     return steams, next_window_in if races_in_window == 0 else 0
@@ -363,7 +368,7 @@ if __name__ == "__main__":
     log("=== STEAMER MONITOR (Runner 2) STARTING ===")
     log(f"Window: T-{STEAM_WINDOW_START // 60}m to T-{STEAM_WINDOW_END // 60}m "
         f"| drop > {STEAM_DROP_PCT:.0%} | volume > 0 "
-        f"| current odds < {MAX_ALERT_ODDS:.0f} "
+        f"| fires when current odds < {MAX_ALERT_ODDS:.0f} (pending until then) "
         f"| UK & IRELAND ONLY | today's card")
     load_state()
     log("Warm-up scan (no alerts)...")
@@ -394,3 +399,8 @@ if __name__ == "__main__":
             err(f"Loop error: {e}", e)
             sleep_for = FAST_LOOP
         time.sleep(sleep_for)
+    ```
+
+The behaviour change: a qualifying dropper at 20+ is no longer marked alerted. It's logged once as `PENDING (armed)` and re-checked every 5 seconds; the instant its mid dips below 20 — with volume still positive and still before T-1min — the alert fires, showing the full journey (e.g. `28.00 ➜ 19.50, -30.4%`). If it never gets under 20 before the window closes, no alert, and the baseline purges after the race.
+
+The status line now shows `pending=` — armed horses currently waiting above the line — so you can see the mechanism working in real time. One thing you'll notice in practice: alerts arriving via the pending path will show unusually large drop percentages, because they've steamed all the way from a big baseline down through 20. Those are exactly the dramatic moves worth seeing, which is why your instinct to keep them armed was right.
