@@ -24,17 +24,24 @@ HEADERS = {
     "Accept": "application/json",
 }
 
-FAST_LOOP = 5                 # tick when races are in/near the window
-IDLE_LOOP = 30                # tick when nothing is near the window
-STEAM_WINDOW_START = 1800     # T-30min: window opens, baseline set
-STEAM_WINDOW_END = 60         # T-1min: window closes
-STEAM_DROP_PCT = 0.20         # alert when drop is MORE than 20%
+FAST_LOOP = 5
+IDLE_LOOP = 30
+STEAM_WINDOW_START = 1800     # T-30min
+STEAM_WINDOW_END = 60         # T-1min
+STEAM_DROP_PCT = 0.20
 SEEN_TTL_SECONDS = 86400
 STATE_FILE = os.environ.get("STATE_FILE", "steam_state.json")
 UK_TZ = ZoneInfo("Europe/London")
 
-steam_baseline = {}   # runner_id -> {"mid","ts","name","race","race_time","race_epoch"}
-steam_alerted = {}    # runner_id -> epoch
+ALLOWED_COUNTRIES = {
+    "united kingdom", "uk", "great britain", "england", "scotland", "wales",
+    "ireland", "republic of ireland", "eire",
+}
+
+steam_baseline = {}
+steam_alerted = {}
+event_seen = {}        # event_id -> {"name","included","tags"} (audit trail)
+_audit_sent = False
 
 
 def log(msg):
@@ -51,6 +58,19 @@ def err(msg, exc=None):
 def is_today_uk(event_dt_utc):
     now_uk = datetime.datetime.now(UK_TZ)
     return event_dt_utc.astimezone(UK_TZ).date() == now_uk.date()
+
+
+def country_tags(event):
+    tags = event.get("meta-tags") or event.get("metaTags") or []
+    names = []
+    for t in tags:
+        if isinstance(t, dict):
+            names.append(str(t.get("name", "")).strip().lower())
+    return names
+
+
+def is_uk_or_ireland(event):
+    return any(n in ALLOWED_COUNTRIES for n in country_tags(event))
 
 
 # ---------- persistence ----------
@@ -132,7 +152,6 @@ def is_withdrawn(runner):
 
 
 def extract_book(runner):
-    """Binary exchange: side 'win' = back, side 'lose' -> lay-equivalent."""
     win_prices, lose_prices = [], []
     for p in runner.get("prices", []) or []:
         if not isinstance(p, dict):
@@ -179,11 +198,31 @@ def build_steam_alert(name, race, race_time, baseline, base_ts,
     )
 
 
+def send_coverage_audit():
+    """Telegram the day's classification so it can be checked by eye."""
+    included = sorted(v["name"] for v in event_seen.values() if v["included"])
+    excluded = sorted(v["name"] for v in event_seen.values() if not v["included"])
+
+    def fmt_list(items, cap=40):
+        body = "\n".join(f"• {x}" for x in items[:cap])
+        extra = f"\n_...and {len(items) - cap} more_" if len(items) > cap else ""
+        return (body + extra) if items else "_none_"
+
+    send_telegram(
+        f"📋 *STEAMER COVERAGE — today's classification*\n\n"
+        f"✅ *Watching ({len(included)}):*\n{fmt_list(included)}\n\n"
+        f"🚫 *Excluded ({len(excluded)}):*\n{fmt_list(excluded)}\n\n"
+        f"_Cross-check the ✅ list against today's UK/IRE card. "
+        f"If a UK/IRE meeting is under 🚫, tell the bot owner._"
+    )
+
+
 # ---------- core ----------
 def scan(warmup=False):
-    """Returns (alerts_sent, seconds_to_next_window_race)."""
-    steams = races_in_window = runners_tracked = 0
+    global _audit_sent
+    steams = races_in_window = runners_tracked = skipped_country = 0
     next_window_in = None
+    new_events = []
 
     try:
         events = get_json(EVENTS_URL).get("events", []) or []
@@ -208,7 +247,23 @@ def scan(warmup=False):
         if delta <= 0 or not is_today_uk(event_dt):
             continue
 
-        # track when the next race will enter the window (for adaptive sleep)
+        eid = event.get("id")
+        ename = event.get("name", "Unknown Race")
+        included = is_uk_or_ireland(event)
+
+        # ---- AUDIT TRAIL: every first-seen event is logged + recorded ----
+        if eid not in event_seen:
+            tags = country_tags(event)
+            event_seen[eid] = {"name": ename, "included": included,
+                               "tags": tags}
+            log(f"EVENT {'INCLUDED' if included else 'EXCLUDED'}: "
+                f"{ename} | tags={tags}")
+            new_events.append(eid)
+
+        if not included:
+            skipped_country += 1
+            continue
+
         if delta > STEAM_WINDOW_START:
             gap = delta - STEAM_WINDOW_START
             if next_window_in is None or gap < next_window_in:
@@ -218,10 +273,10 @@ def scan(warmup=False):
         if delta < STEAM_WINDOW_END:
             continue
 
-        # --- race is inside T-30m .. T-1m ---
+        # --- race inside T-30m .. T-1m ---
         races_in_window += 1
-        event_id = event.get("id")
-        event_name = event.get("name", "Unknown Race")
+        event_id = eid
+        event_name = ename
         race_time = start_str[:16].replace("T", " ")
         race_epoch = event_dt.timestamp()
         mins_to_off = int(delta / 60)
@@ -269,7 +324,6 @@ def scan(warmup=False):
                     continue
                 if vol <= 0:
                     continue
-                # strict: drop must be MORE than 20%
                 if mid >= base["mid"] * (1 - STEAM_DROP_PCT):
                     continue
 
@@ -288,8 +342,21 @@ def scan(warmup=False):
                     steams += 1
                     save_state()
 
+    # ---- SAFETY CHECKS ----
+    inc_count = sum(1 for v in event_seen.values() if v["included"])
+    exc_count = len(event_seen) - inc_count
+
+    # If we've seen events today but included ZERO, the tag structure is
+    # wrong and the strict filter is eating everything — loud warning.
+    if event_seen and inc_count == 0:
+        err("COVERAGE WARNING: every event today is EXCLUDED by the country "
+            "filter. Tag structure likely differs — check EVENT EXCLUDED "
+            "lines above and report.")
+
     purge_stale()
     log(f"in_window_races={races_in_window} tracked={runners_tracked} "
+        f"skipped_country={skipped_country} "
+        f"events_today={inc_count}✅/{exc_count}🚫 "
         f"baselines={len(steam_baseline)} alerts={steams}")
     return steams, next_window_in if races_in_window == 0 else 0
 
@@ -297,8 +364,8 @@ def scan(warmup=False):
 if __name__ == "__main__":
     log("=== STEAMER MONITOR (Runner 2) STARTING ===")
     log(f"Window: T-{STEAM_WINDOW_START // 60}m to T-{STEAM_WINDOW_END // 60}m "
-        f"| drop > {STEAM_DROP_PCT:.0%} from window-open price "
-        f"| volume > 0 | today's UK card | no odds cap")
+        f"| drop > {STEAM_DROP_PCT:.0%} | volume > 0 | no odds cap "
+        f"| UK & IRELAND ONLY | today's card")
     load_state()
     log("Warm-up scan (no alerts)...")
     try:
@@ -306,6 +373,12 @@ if __name__ == "__main__":
     except Exception as e:
         err(f"Warm-up failed: {e}", e)
     save_state()
+
+    # one Telegram audit at startup: today's included/excluded lists
+    try:
+        send_coverage_audit()
+    except Exception as e:
+        err(f"Audit send failed: {e}", e)
     log("Alerting live.")
 
     cycle = 0
@@ -315,12 +388,7 @@ if __name__ == "__main__":
             cycle += 1
             if cycle % 60 == 0:
                 save_state()
-            # adaptive sleep: fast when racing is in/near the window,
-            # relaxed when the next race is far away
-            if next_in is not None and next_in > 300:
-                sleep_for = IDLE_LOOP
-            else:
-                sleep_for = FAST_LOOP
+            sleep_for = IDLE_LOOP if (next_in is not None and next_in > 300) else FAST_LOOP
         except KeyboardInterrupt:
             save_state()
             log("Stopped.")
