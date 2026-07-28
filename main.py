@@ -26,13 +26,29 @@ HEADERS = {
 
 FAST_LOOP = 5
 IDLE_LOOP = 30
-STEAM_WINDOW_START = 1800     # T-30min
-STEAM_WINDOW_END = 60         # T-1min
-STEAM_DROP_PCT = 0.20         # drop must be MORE than 20%
-MAX_ALERT_ODDS = 20.0         # alert fires only once current odds are BELOW this
+WATCH_WINDOW = 300            # last 5 minutes before the off
 SEEN_TTL_SECONDS = 86400
 STATE_FILE = os.environ.get("STATE_FILE", "steam_state.json")
 UK_TZ = ZoneInfo("Europe/London")
+
+# Tiered drop thresholds, chosen by the horse's BASELINE price
+# (its price when the 5-minute window opened). Bands in decimal odds:
+#   <= 4.0   (3/1 or shorter)   : drop > 10%
+#   4.0-9.0  (between, filled)  : drop > 20%
+#   9.0-15.0 (8/1 to 14/1)      : drop > 30%
+#   15.0-21.0 (between, filled) : drop > 40%
+#   >= 21.0  (20/1 or bigger)   : drop > 50%
+def drop_threshold(baseline_odds):
+    if baseline_odds <= 4.0:
+        return 0.10
+    if baseline_odds <= 9.0:
+        return 0.20
+    if baseline_odds <= 15.0:
+        return 0.30
+    if baseline_odds <= 21.0:
+        return 0.40
+    return 0.50
+
 
 ALLOWED_COUNTRIES = {
     "united kingdom", "uk", "great britain", "england", "scotland", "wales",
@@ -41,7 +57,6 @@ ALLOWED_COUNTRIES = {
 
 steam_baseline = {}
 steam_alerted = {}
-pending_logged = set()
 event_seen = {}
 
 
@@ -72,6 +87,18 @@ def country_tags(event):
 
 def is_uk_or_ireland(event):
     return any(n in ALLOWED_COUNTRIES for n in country_tags(event))
+
+
+def band_label(baseline_odds):
+    if baseline_odds <= 4.0:
+        return "Short favourite"
+    if baseline_odds <= 9.0:
+        return "Second tier"
+    if baseline_odds <= 15.0:
+        return "Mid-range"
+    if baseline_odds <= 21.0:
+        return "Outsider"
+    return "Longshot"
 
 
 def load_state():
@@ -110,7 +137,6 @@ def purge_stale():
     for r in [r for r, v in steam_baseline.items()
               if now > v.get("race_epoch", now) + 600]:
         steam_baseline.pop(r, None)
-        pending_logged.discard(r)
     for r in [r for r, t in steam_alerted.items()
               if now - t > SEEN_TTL_SECONDS]:
         steam_alerted.pop(r, None)
@@ -183,12 +209,13 @@ def extract_book(runner):
 
 
 def build_steam_alert(name, race, race_time, baseline, base_ts,
-                      current, vol, mins_to_off):
+                      current, vol, mins_to_off, band, threshold):
     drop = (baseline - current) / baseline * 100
     return (
-        f"🔥 *MARKET MOVE — HEAVY BACKING*\n\n"
+        f"🔥 *LATE MARKET MOVE*\n\n"
         f"🏇 *Horse:* {name}\n"
         f"📍 *Race:* {race}\n"
+        f"🏷️ *Band:* {band} (trigger > {threshold:.0%})\n"
         f"📉 *Odds:* `{baseline:.2f}` ➜ `{current:.2f}`\n"
         f"⚡ *Drop:* `-{drop:.1f}%` since `{base_ts} UTC`\n"
         f"💰 *Matched Volume:* `{vol:,.0f}`\n"
@@ -216,7 +243,6 @@ def send_coverage_audit():
 
 def scan(warmup=False):
     steams = races_in_window = runners_tracked = skipped_country = 0
-    pending_count = 0
     next_window_in = None
 
     try:
@@ -257,21 +283,19 @@ def scan(warmup=False):
             skipped_country += 1
             continue
 
-        if delta > STEAM_WINDOW_START:
-            gap = delta - STEAM_WINDOW_START
+        if delta > WATCH_WINDOW:
+            gap = delta - WATCH_WINDOW
             if next_window_in is None or gap < next_window_in:
                 next_window_in = gap
             continue
 
-        if delta < STEAM_WINDOW_END:
-            continue
-
+        # --- race inside its final 5 minutes ---
         races_in_window += 1
         event_id = eid
         event_name = ename
         race_time = start_str[:16].replace("T", " ")
         race_epoch = event_dt.timestamp()
-        mins_to_off = int(delta / 60)
+        mins_to_off = max(1, int(delta / 60))
 
         for market in event.get("markets", []) or []:
             if "win" not in str(market.get("name", "")).lower():
@@ -302,9 +326,13 @@ def scan(warmup=False):
 
                 base = steam_baseline.get(rid)
                 if base is None:
+                    # first sighting inside the final 5 minutes = baseline;
+                    # its price here fixes the band and threshold
                     steam_baseline[rid] = {
                         "mid": mid,
                         "ts": now_utc.strftime("%H:%M:%S"),
+                        "threshold": drop_threshold(mid),
+                        "band": band_label(mid),
                         "name": rname,
                         "race": event_name,
                         "race_time": race_time,
@@ -316,16 +344,7 @@ def scan(warmup=False):
                     continue
                 if vol <= 0:
                     continue
-                if mid >= base["mid"] * (1 - STEAM_DROP_PCT):
-                    continue
-
-                if mid >= MAX_ALERT_ODDS:
-                    pending_count += 1
-                    if rid not in pending_logged:
-                        pending_logged.add(rid)
-                        log(f"PENDING (odds {mid:.1f} >= "
-                            f"{MAX_ALERT_ODDS:.0f}, armed): {rname} @ "
-                            f"{event_name} {base['mid']:.2f}->{mid:.2f}")
+                if mid >= base["mid"] * (1 - base["threshold"]):
                     continue
 
                 if warmup:
@@ -334,13 +353,14 @@ def scan(warmup=False):
 
                 msg = build_steam_alert(
                     rname, event_name, race_time,
-                    base["mid"], base["ts"], mid, vol, mins_to_off)
-                log(f"STEAMER: {rname} @ {event_name} "
+                    base["mid"], base["ts"], mid, vol, mins_to_off,
+                    base["band"], base["threshold"])
+                log(f"STEAMER [{base['band']}, >{base['threshold']:.0%}]: "
+                    f"{rname} @ {event_name} "
                     f"{base['mid']:.2f}->{mid:.2f} vol={vol:.0f} "
                     f"T-{mins_to_off}m")
                 if send_telegram(msg):
                     steam_alerted[rid] = now_epoch
-                    pending_logged.discard(rid)
                     steams += 1
                     save_state()
 
@@ -352,18 +372,18 @@ def scan(warmup=False):
 
     purge_stale()
     log(f"in_window_races={races_in_window} tracked={runners_tracked} "
-        f"skipped_country={skipped_country} pending={pending_count} "
+        f"skipped_country={skipped_country} "
         f"events_today={inc_count}✅/{exc_count}🚫 "
         f"baselines={len(steam_baseline)} alerts={steams}")
     return steams, next_window_in if races_in_window == 0 else 0
 
 
 if __name__ == "__main__":
-    log("=== STEAMER MONITOR (Runner 2) STARTING ===")
-    log(f"Window: T-{STEAM_WINDOW_START // 60}m to T-{STEAM_WINDOW_END // 60}m "
-        f"| drop > {STEAM_DROP_PCT:.0%} | volume > 0 "
-        f"| fires when current odds < {MAX_ALERT_ODDS:.0f} (pending until then) "
-        f"| UK & IRELAND ONLY | today's card")
+    log("=== STEAMER MONITOR (Runner 2 v2) STARTING ===")
+    log("Window: final 5 minutes before the off | volume > 0 | "
+        "UK & IRELAND ONLY | today's card")
+    log("Tiered triggers by baseline odds: <=4.0 -> 10% | 4-9 -> 20% | "
+        "9-15 -> 30% | 15-21 -> 40% | >=21 -> 50%")
     load_state()
     log("Warm-up scan (no alerts)...")
     try:
