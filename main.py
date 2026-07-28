@@ -28,7 +28,8 @@ FAST_LOOP = 5
 IDLE_LOOP = 30
 STEAM_WINDOW_START = 1800     # T-30min
 STEAM_WINDOW_END = 60         # T-1min
-STEAM_DROP_PCT = 0.20
+STEAM_DROP_PCT = 0.20         # drop must be MORE than 20%
+MAX_ALERT_ODDS = 20.0         # alert only if current odds BELOW this
 SEEN_TTL_SECONDS = 86400
 STATE_FILE = os.environ.get("STATE_FILE", "steam_state.json")
 UK_TZ = ZoneInfo("Europe/London")
@@ -40,8 +41,7 @@ ALLOWED_COUNTRIES = {
 
 steam_baseline = {}
 steam_alerted = {}
-event_seen = {}        # event_id -> {"name","included","tags"} (audit trail)
-_audit_sent = False
+event_seen = {}
 
 
 def log(msg):
@@ -199,7 +199,6 @@ def build_steam_alert(name, race, race_time, baseline, base_ts,
 
 
 def send_coverage_audit():
-    """Telegram the day's classification so it can be checked by eye."""
     included = sorted(v["name"] for v in event_seen.values() if v["included"])
     excluded = sorted(v["name"] for v in event_seen.values() if not v["included"])
 
@@ -212,17 +211,15 @@ def send_coverage_audit():
         f"📋 *STEAMER COVERAGE — today's classification*\n\n"
         f"✅ *Watching ({len(included)}):*\n{fmt_list(included)}\n\n"
         f"🚫 *Excluded ({len(excluded)}):*\n{fmt_list(excluded)}\n\n"
-        f"_Cross-check the ✅ list against today's UK/IRE card. "
-        f"If a UK/IRE meeting is under 🚫, tell the bot owner._"
+        f"_Cross-check the ✅ list against today's UK/IRE card._"
     )
 
 
 # ---------- core ----------
 def scan(warmup=False):
-    global _audit_sent
     steams = races_in_window = runners_tracked = skipped_country = 0
+    skipped_longshot = 0
     next_window_in = None
-    new_events = []
 
     try:
         events = get_json(EVENTS_URL).get("events", []) or []
@@ -251,14 +248,12 @@ def scan(warmup=False):
         ename = event.get("name", "Unknown Race")
         included = is_uk_or_ireland(event)
 
-        # ---- AUDIT TRAIL: every first-seen event is logged + recorded ----
         if eid not in event_seen:
             tags = country_tags(event)
             event_seen[eid] = {"name": ename, "included": included,
                                "tags": tags}
             log(f"EVENT {'INCLUDED' if included else 'EXCLUDED'}: "
                 f"{ename} | tags={tags}")
-            new_events.append(eid)
 
         if not included:
             skipped_country += 1
@@ -273,7 +268,6 @@ def scan(warmup=False):
         if delta < STEAM_WINDOW_END:
             continue
 
-        # --- race inside T-30m .. T-1m ---
         races_in_window += 1
         event_id = eid
         event_name = ename
@@ -327,6 +321,15 @@ def scan(warmup=False):
                 if mid >= base["mid"] * (1 - STEAM_DROP_PCT):
                     continue
 
+                # --- NEW: odds cap at notification time ---
+                if mid >= MAX_ALERT_ODDS:
+                    steam_alerted[rid] = now_epoch  # mute; still a longshot
+                    skipped_longshot += 1
+                    log(f"SKIPPED (odds {mid:.1f} >= {MAX_ALERT_ODDS:.0f}): "
+                        f"{rname} @ {event_name} "
+                        f"{base['mid']:.2f}->{mid:.2f}")
+                    continue
+
                 if warmup:
                     steam_alerted[rid] = now_epoch
                     continue
@@ -342,20 +345,15 @@ def scan(warmup=False):
                     steams += 1
                     save_state()
 
-    # ---- SAFETY CHECKS ----
     inc_count = sum(1 for v in event_seen.values() if v["included"])
     exc_count = len(event_seen) - inc_count
-
-    # If we've seen events today but included ZERO, the tag structure is
-    # wrong and the strict filter is eating everything — loud warning.
     if event_seen and inc_count == 0:
         err("COVERAGE WARNING: every event today is EXCLUDED by the country "
-            "filter. Tag structure likely differs — check EVENT EXCLUDED "
-            "lines above and report.")
+            "filter — check EVENT EXCLUDED lines above and report.")
 
     purge_stale()
     log(f"in_window_races={races_in_window} tracked={runners_tracked} "
-        f"skipped_country={skipped_country} "
+        f"skipped_country={skipped_country} skipped_longshot={skipped_longshot} "
         f"events_today={inc_count}✅/{exc_count}🚫 "
         f"baselines={len(steam_baseline)} alerts={steams}")
     return steams, next_window_in if races_in_window == 0 else 0
@@ -364,7 +362,8 @@ def scan(warmup=False):
 if __name__ == "__main__":
     log("=== STEAMER MONITOR (Runner 2) STARTING ===")
     log(f"Window: T-{STEAM_WINDOW_START // 60}m to T-{STEAM_WINDOW_END // 60}m "
-        f"| drop > {STEAM_DROP_PCT:.0%} | volume > 0 | no odds cap "
+        f"| drop > {STEAM_DROP_PCT:.0%} | volume > 0 "
+        f"| current odds < {MAX_ALERT_ODDS:.0f} "
         f"| UK & IRELAND ONLY | today's card")
     load_state()
     log("Warm-up scan (no alerts)...")
@@ -373,8 +372,6 @@ if __name__ == "__main__":
     except Exception as e:
         err(f"Warm-up failed: {e}", e)
     save_state()
-
-    # one Telegram audit at startup: today's included/excluded lists
     try:
         send_coverage_audit()
     except Exception as e:
