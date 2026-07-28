@@ -41,7 +41,7 @@ ALLOWED_COUNTRIES = {
 
 steam_baseline = {}
 steam_alerted = {}
-pending_logged = set()   # runners already logged as pending (log once, not every 5s)
+pending_logged = set()
 event_seen = {}
 
 
@@ -74,7 +74,6 @@ def is_uk_or_ireland(event):
     return any(n in ALLOWED_COUNTRIES for n in country_tags(event))
 
 
-# ---------- persistence ----------
 def load_state():
     if not os.path.exists(STATE_FILE):
         log("No state file — cold start.")
@@ -117,7 +116,6 @@ def purge_stale():
         steam_alerted.pop(r, None)
 
 
-# ---------- network ----------
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = json.dumps(
@@ -144,7 +142,6 @@ def get_json(url):
         return json.loads(r.read().decode("utf-8"))
 
 
-# ---------- parsing ----------
 def is_withdrawn(runner):
     status = str(runner.get("status", "")).lower()
     wd = runner.get("withdrawn")
@@ -217,7 +214,6 @@ def send_coverage_audit():
     )
 
 
-# ---------- core ----------
 def scan(warmup=False):
     steams = races_in_window = runners_tracked = skipped_country = 0
     pending_count = 0
@@ -323,8 +319,6 @@ def scan(warmup=False):
                 if mid >= base["mid"] * (1 - STEAM_DROP_PCT):
                     continue
 
-                # --- PENDING behaviour: >20% dropper still at 20+ stays
-                # armed; fires the moment it dips below MAX_ALERT_ODDS ---
                 if mid >= MAX_ALERT_ODDS:
                     pending_count += 1
                     if rid not in pending_logged:
@@ -399,8 +393,3 @@ if __name__ == "__main__":
             err(f"Loop error: {e}", e)
             sleep_for = FAST_LOOP
         time.sleep(sleep_for)
-    ```
-
-The behaviour change: a qualifying dropper at 20+ is no longer marked alerted. It's logged once as `PENDING (armed)` and re-checked every 5 seconds; the instant its mid dips below 20 — with volume still positive and still before T-1min — the alert fires, showing the full journey (e.g. `28.00 ➜ 19.50, -30.4%`). If it never gets under 20 before the window closes, no alert, and the baseline purges after the race.
-
-The status line now shows `pending=` — armed horses currently waiting above the line — so you can see the mechanism working in real time. One thing you'll notice in practice: alerts arriving via the pending path will show unusually large drop percentages, because they've steamed all the way from a big baseline down through 20. Those are exactly the dramatic moves worth seeing, which is why your instinct to keep them armed was right.
