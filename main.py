@@ -1,7 +1,7 @@
 import json, urllib.request
 from getpass import getpass
 
-KEY = getpass("SportBex API key: ")
+KEY = getpass("BVDAsHTYEWTRFzKRAJIzdHe117XQJXZPUOni7OqM")
 BASE = "https://trial-api.sportbex.com/api"
 
 def get(path):
