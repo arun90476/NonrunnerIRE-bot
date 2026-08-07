@@ -16,7 +16,7 @@ except Exception:
     pass
 
 # --- CONFIG ---
-SPORTBEX_API_KEY = os.environ["BVDAsHTYEWTRFzKRAJIzdHe117XQJXZPUOni7OqM"]
+SPORTBEX_API_KEY = os.environ.get("SPORTBEX_API_KEY", "BVDAsHTYEWTRFzKRAJIzdHe117XQJXZPUOni7OqM")
 SPORTBEX_BASE = os.environ.get(
     "SPORTBEX_BASE", "https://trial-api.sportbex.com/api")
 
