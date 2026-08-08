@@ -28,12 +28,24 @@ ALLOWED_REGIONS = (set() if REGIONS.strip().upper() == "ALL"
                    else {r.strip().upper() for r in REGIONS.split(",")
                          if r.strip()})
 
-# alert only when MIN_ODDS <= back price < MAX_ODDS
+# Per-country lead-time limit: only alert if the race starts within
+# N hours. Format "US:2" or "US:2,AU:3". Countries not listed have no
+# limit. Checked first, so suppressed alerts cost no extra API call.
+LEAD_LIMITS_RAW = os.environ.get("LEAD_LIMITS", "US:2")
+LEAD_LIMITS = {}
+for _part in LEAD_LIMITS_RAW.split(","):
+    _part = _part.strip()
+    if not _part or ":" not in _part:
+        continue
+    _c, _h = _part.split(":", 1)
+    try:
+        LEAD_LIMITS[_c.strip().upper()] = float(_h.strip()) * 3600.0
+    except ValueError:
+        pass
+
 MAX_ODDS = float(os.environ.get("MAX_ODDS", "6.0"))
 MIN_ODDS = float(os.environ.get("MIN_ODDS", "1.20"))
-# ...unless the official Betfair RF proves a genuine odds-on favourite
 GENUINE_FAV_RF = float(os.environ.get("GENUINE_FAV_RF", "50.0"))
-# if the RF cannot be determined at all, err on the side of alerting
 MIN_ODDS_ALERT_ON_UNKNOWN_RF = os.environ.get(
     "MIN_ODDS_ALERT_ON_UNKNOWN_RF", "1") == "1"
 RF_ATTEMPTS = int(os.environ.get("RF_ATTEMPTS", "2"))
@@ -91,7 +103,8 @@ _cycle_count = 0
 _active_base = API_BASE
 STATS = {"calls": 0, "errors": 0, "recon_mismatch": 0, "vanished": 0,
          "filtered_no_price": 0, "filtered_odds": 0, "filtered_min_odds": 0,
-         "place_dropped": 0, "official_rf": 0, "derived_rf": 0,
+         "filtered_lead_time": 0, "place_dropped": 0,
+         "official_rf": 0, "derived_rf": 0,
          "rf_unknown": 0, "min_odds_override": 0}
 
 
@@ -463,7 +476,7 @@ def register(market, event, competition):
         "race_label": race_label,
         "market_name": market["market_name"],
         "venue": venue,
-        "country": country,
+        "country": country.upper(),
         "race_epoch": start.timestamp() if start else now_e + 86400,
         "race_time": (local.strftime("%H:%M %d-%b") + " (" + tzname + ")"
                       if local else "unknown"),
@@ -601,6 +614,7 @@ def fire_alert(info, key, name, status, price, price_side, prev, official,
         trend = "📈 *Move:* `" + " → ".join(
             str(h["p"]) for h in hist) + "`\n"
     age = int((time.time() - (prev or {}).get("epoch", time.time())) / 60)
+    to_off = int((info["race_epoch"] - time.time()) / 60)
     lay_line = ""
     if (prev or {}).get("lay") and price_side == "back":
         lay_line = "📘 *Lay:* `" + fmt((prev or {}).get("lay")) + "`\n"
@@ -615,6 +629,7 @@ def fire_alert(info, key, name, status, price, price_side, prev, official,
            + "🔄 *Status:* `ACTIVE ➜ " + status + "`\n"
            + "📊 *" + side_label + ":* `" + fmt(price) + "`\n"
            + lay_line + trend + rf_line + warn_line
+           + "⏳ *Off in:* ~" + str(to_off) + " min\n"
            + "🕐 *Price from:* `" + str((prev or {}).get("ts")) + " UTC` ("
            + str(age) + "m before)\n"
            + "⏰ *Race Time:* " + info["race_time"])
@@ -623,6 +638,7 @@ def fire_alert(info, key, name, status, price, price_side, prev, official,
         + " [ACTIVE -> " + status + "] " + price_side + "=" + fmt(price)
         + " rf=" + ("official {:.2f}".format(official)
                     if official is not None else "derived")
+        + " off_in=" + str(to_off) + "m"
         + (" UNVERIFIED" if unverified else ""))
     if send_telegram(msg):
         alerted[key] = time.time()
@@ -632,6 +648,19 @@ def fire_alert(info, key, name, status, price, price_side, prev, official,
 
 
 def evaluate_transition(info, key, name, status, back, prev):
+    # ---- lead-time gate: cheapest check, runs before anything else ----
+    limit = LEAD_LIMITS.get(str(info.get("country", "")).upper())
+    if limit is not None:
+        to_off = info["race_epoch"] - time.time()
+        if to_off > limit:
+            alerted[key] = time.time()
+            STATS["filtered_lead_time"] += 1
+            log("FILTERED: " + name + " @ " + info["race_label"]
+                + " — " + info["country"] + " race starts in "
+                + "{:.1f}h".format(to_off / 3600.0) + ", limit is "
+                + "{:.1f}h".format(limit / 3600.0))
+            return 0
+
     price = back or (prev or {}).get("back")
     side = "back"
     if not price and LAY_FALLBACK:
@@ -659,9 +688,6 @@ def evaluate_transition(info, key, name, status, back, prev):
     official = fetch_official_rf(mid, sid)
     unverified = False
 
-    # Prices below MIN_ODDS are usually placeholder liquidity on thin
-    # markets (1.15 / 1.02 / 1.01 ladders). A genuine odds-on favourite
-    # is the exception — its official RF is very high, so it passes.
     if price < MIN_ODDS:
         if official is not None and official >= GENUINE_FAV_RF:
             STATS["min_odds_override"] += 1
@@ -866,6 +892,7 @@ def poll_cycle():
         + " tracked=" + str(len(runner_state))
         + " alerts=" + str(alerts)
         + " failing=" + str(failing)
+        + " lead_time=" + str(STATS["filtered_lead_time"])
         + " no_price=" + str(STATS["filtered_no_price"])
         + " min_odds=" + str(STATS["filtered_min_odds"])
         + " max_odds=" + str(STATS["filtered_odds"])
@@ -890,6 +917,12 @@ if __name__ == "__main__":
                        else str(sorted(ALLOWED_REGIONS)))
         + " | days ahead: " + ("unlimited" if MAX_DAYS_AHEAD == 0
                                else str(MAX_DAYS_AHEAD)))
+    if LEAD_LIMITS:
+        log("Lead-time limits: " + ", ".join(
+            k + " within " + "{:.1f}".format(v / 3600.0) + "h"
+            for k, v in sorted(LEAD_LIMITS.items())))
+    else:
+        log("Lead-time limits: none")
     log("Trigger: runner ACTIVE -> ANY other status, or vanished")
     log("Odds window: " + str(MIN_ODDS) + " <= back price < " + str(MAX_ODDS))
     log("Below " + str(MIN_ODDS) + ": alert only if official RF >= "
@@ -936,7 +969,9 @@ if __name__ == "__main__":
                   + "\n" + str(len(registry)) + " races registered, "
                   + str(len(runner_state)) + " runners tracked."
                   + "\nOdds window: " + str(MIN_ODDS) + " - "
-                  + str(MAX_ODDS))
+                  + str(MAX_ODDS)
+                  + ("\nLead limit: " + LEAD_LIMITS_RAW
+                     if LEAD_LIMITS else ""))
     log("Alerting live.")
 
     last_discover = time.time()
