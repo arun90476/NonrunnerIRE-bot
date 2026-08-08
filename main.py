@@ -28,7 +28,16 @@ ALLOWED_REGIONS = (set() if REGIONS.strip().upper() == "ALL"
                    else {r.strip().upper() for r in REGIONS.split(",")
                          if r.strip()})
 
+# alert only when MIN_ODDS <= back price < MAX_ODDS
 MAX_ODDS = float(os.environ.get("MAX_ODDS", "6.0"))
+MIN_ODDS = float(os.environ.get("MIN_ODDS", "1.20"))
+# ...unless the official Betfair RF proves a genuine odds-on favourite
+GENUINE_FAV_RF = float(os.environ.get("GENUINE_FAV_RF", "50.0"))
+# if the RF cannot be determined at all, err on the side of alerting
+MIN_ODDS_ALERT_ON_UNKNOWN_RF = os.environ.get(
+    "MIN_ODDS_ALERT_ON_UNKNOWN_RF", "1") == "1"
+RF_ATTEMPTS = int(os.environ.get("RF_ATTEMPTS", "2"))
+
 LAY_FALLBACK = os.environ.get("LAY_FALLBACK", "0") == "1"
 OFFICIAL_RF = os.environ.get("OFFICIAL_RF", "1") == "1"
 
@@ -81,8 +90,9 @@ _reg_counter = 0
 _cycle_count = 0
 _active_base = API_BASE
 STATS = {"calls": 0, "errors": 0, "recon_mismatch": 0, "vanished": 0,
-         "filtered_no_price": 0, "filtered_odds": 0, "place_dropped": 0,
-         "official_rf": 0, "derived_rf": 0}
+         "filtered_no_price": 0, "filtered_odds": 0, "filtered_min_odds": 0,
+         "place_dropped": 0, "official_rf": 0, "derived_rf": 0,
+         "rf_unknown": 0, "min_odds_override": 0}
 
 
 def log(msg):
@@ -233,7 +243,6 @@ def as_list(obj, *container_keys):
 
 
 def unwrap(payload):
-    """market-odds arrives as {"status": true, "data": {...}}."""
     if isinstance(payload, dict):
         d = payload.get("data")
         if isinstance(d, dict):
@@ -277,7 +286,6 @@ def as_int(v):
 
 
 def first_price(runner, side):
-    """FIRST entry of the runner's back/lay array — the best available."""
     arr = g(runner, side, default=None)
     if not isinstance(arr, list) or not arr:
         return None
@@ -293,25 +301,15 @@ def first_price(runner, side):
         return None
 
 
-# -------- official Betfair reduction factor, fetched at alert time --------
-def fetch_official_rf(mid, sid):
-    """POST the single marketId to market-listMarketBook and read the
-    runner's adjustmentFactor. Raw Betfair format: no runnerName, prices
-    under ex.availableToBack, and adjustmentFactor per runner."""
-    if not OFFICIAL_RF:
-        return None
-    try:
-        raw = api_post("/racing/market-listMarketBook", {"marketIds": [mid]},
-                       "listMarketBook " + mid)
-    except Exception:
-        return None
-
+# -------- official Betfair reduction factor (retried) --------
+def _rf_once(mid, sid):
+    raw = api_post("/racing/market-listMarketBook", {"marketIds": [mid]},
+                   "listMarketBook " + mid)
     books = raw.get("data") if isinstance(raw, dict) else raw
     if isinstance(books, dict):
         books = [books]
     if not isinstance(books, list):
         return None
-
     for b in books:
         if not isinstance(b, dict):
             continue
@@ -326,6 +324,26 @@ def fetch_official_rf(mid, sid):
             except (TypeError, ValueError):
                 return None
             return af if af > 0 else None
+    return None
+
+
+def fetch_official_rf(mid, sid):
+    """Retried, because a failed lookup would otherwise suppress the
+    single most valuable alert: a genuine odds-on favourite withdrawn."""
+    if not OFFICIAL_RF:
+        return None
+    for attempt in range(max(1, RF_ATTEMPTS)):
+        try:
+            af = _rf_once(mid, sid)
+        except Exception as e:
+            af = None
+            if attempt + 1 >= RF_ATTEMPTS:
+                err("RF lookup failed after " + str(RF_ATTEMPTS)
+                    + " attempts (" + mid + ":" + sid + "): " + str(e))
+        if af is not None:
+            return af
+        if attempt + 1 < RF_ATTEMPTS:
+            time.sleep(1.0)
     return None
 
 
@@ -402,8 +420,9 @@ def pick_race_markets(markets, fallback_dt):
                           default="Selection " + str(sid)))
             meta = g(r, "metadata", default={}) or {}
             cloth = str(g(meta, "CLOTH_NUMBER", default="") or "").strip()
-            runners[str(sid)] = ((cloth + " " + rname).strip()
-                                 if cloth else rname)
+            if cloth and not rname.lstrip().startswith(cloth):
+                rname = cloth + " " + rname
+            runners[str(sid)] = rname
         key = mstart.isoformat() if mstart else str(mid)
         cand = {"market_id": str(mid), "market_name": mname,
                 "runners": runners, "start": mstart}
@@ -560,10 +579,8 @@ def probe_new_endpoints():
 
 
 # ---------------- alerting ----------------
-def fire_alert(info, key, name, status, price, price_side, prev):
-    mid, sid = key.split(":", 1)
-
-    official = fetch_official_rf(mid, sid)
+def fire_alert(info, key, name, status, price, price_side, prev, official,
+               unverified=False):
     if official is not None:
         STATS["official_rf"] += 1
         rf_line = ("📉 *Reduction Factor:* `{:.2f}%`".format(official)
@@ -572,6 +589,11 @@ def fire_alert(info, key, name, status, price, price_side, prev):
         STATS["derived_rf"] += 1
         rf_line = ("📉 *Reduction Factor:* `~{:.1f}%`".format(
             (1.0 / float(price)) * 100.0) + " _(derived from price)_\n")
+
+    warn_line = ""
+    if unverified:
+        warn_line = ("⚠️ _RF unavailable — sub-" + str(MIN_ODDS)
+                     + " price could not be verified_\n")
 
     hist = (prev or {}).get("hist", [])
     trend = ""
@@ -592,15 +614,16 @@ def fire_alert(info, key, name, status, price, price_side, prev):
            + "🏁 *Market:* " + info["market_name"] + "\n"
            + "🔄 *Status:* `ACTIVE ➜ " + status + "`\n"
            + "📊 *" + side_label + ":* `" + fmt(price) + "`\n"
-           + lay_line + trend + rf_line
+           + lay_line + trend + rf_line + warn_line
            + "🕐 *Price from:* `" + str((prev or {}).get("ts")) + " UTC` ("
            + str(age) + "m before)\n"
            + "⏰ *Race Time:* " + info["race_time"])
 
     log("ALERT: " + name + " @ " + info["race_label"]
         + " [ACTIVE -> " + status + "] " + price_side + "=" + fmt(price)
-        + " rf=" + ("official " + "{:.2f}".format(official)
-                    if official is not None else "derived"))
+        + " rf=" + ("official {:.2f}".format(official)
+                    if official is not None else "derived")
+        + (" UNVERIFIED" if unverified else ""))
     if send_telegram(msg):
         alerted[key] = time.time()
         save_state()
@@ -621,14 +644,56 @@ def evaluate_transition(info, key, name, status, back, prev):
         log("FILTERED: " + name + " @ " + info["race_label"]
             + " [ACTIVE -> " + status + "] — no back price ever stored")
         return 0
-    if float(price) >= MAX_ODDS:
+
+    price = float(price)
+
+    if price >= MAX_ODDS:
         alerted[key] = time.time()
         STATS["filtered_odds"] += 1
         log("FILTERED: " + name + " @ " + info["race_label"]
             + " [ACTIVE -> " + status + "] — " + side + " "
             + fmt(price) + " not < " + str(MAX_ODDS))
         return 0
-    return fire_alert(info, key, name, status, price, side, prev)
+
+    mid, sid = key.split(":", 1)
+    official = fetch_official_rf(mid, sid)
+    unverified = False
+
+    # Prices below MIN_ODDS are usually placeholder liquidity on thin
+    # markets (1.15 / 1.02 / 1.01 ladders). A genuine odds-on favourite
+    # is the exception — its official RF is very high, so it passes.
+    if price < MIN_ODDS:
+        if official is not None and official >= GENUINE_FAV_RF:
+            STATS["min_odds_override"] += 1
+            log("MIN_ODDS OVERRIDE: " + name + " @ " + info["race_label"]
+                + " — " + fmt(price) + " with official RF "
+                + "{:.2f}%".format(official)
+                + " = genuine odds-on favourite")
+        elif official is None:
+            STATS["rf_unknown"] += 1
+            if not MIN_ODDS_ALERT_ON_UNKNOWN_RF:
+                alerted[key] = time.time()
+                STATS["filtered_min_odds"] += 1
+                log("FILTERED: " + name + " @ " + info["race_label"]
+                    + " — " + fmt(price) + " below " + str(MIN_ODDS)
+                    + " and RF unavailable")
+                return 0
+            unverified = True
+            log("RF UNAVAILABLE: " + name + " @ " + info["race_label"]
+                + " — " + fmt(price) + " below " + str(MIN_ODDS)
+                + ", alerting anyway (unverified)")
+        else:
+            alerted[key] = time.time()
+            STATS["filtered_min_odds"] += 1
+            log("FILTERED: " + name + " @ " + info["race_label"]
+                + " [ACTIVE -> " + status + "] — " + side + " "
+                + fmt(price) + " below " + str(MIN_ODDS)
+                + " and official RF " + "{:.2f}%".format(official)
+                + " — placeholder price")
+            return 0
+
+    return fire_alert(info, key, name, status, price, side, prev,
+                      official, unverified)
 
 
 # ---------------- process one market ----------------
@@ -802,7 +867,10 @@ def poll_cycle():
         + " alerts=" + str(alerts)
         + " failing=" + str(failing)
         + " no_price=" + str(STATS["filtered_no_price"])
-        + " odds_filtered=" + str(STATS["filtered_odds"])
+        + " min_odds=" + str(STATS["filtered_min_odds"])
+        + " max_odds=" + str(STATS["filtered_odds"])
+        + " fav_override=" + str(STATS["min_odds_override"])
+        + " rf_unknown=" + str(STATS["rf_unknown"])
         + " place_dropped=" + str(STATS["place_dropped"])
         + " recon=" + str(STATS["recon_mismatch"])
         + " vanished=" + str(STATS["vanished"])
@@ -823,11 +891,12 @@ if __name__ == "__main__":
         + " | days ahead: " + ("unlimited" if MAX_DAYS_AHEAD == 0
                                else str(MAX_DAYS_AHEAD)))
     log("Trigger: runner ACTIVE -> ANY other status, or vanished")
-    log("Condition: last fetched FIRST back price < " + str(MAX_ODDS)
-        + (" (lay fallback ON)" if LAY_FALLBACK else ""))
-    log("Reduction factor: " + ("official Betfair adjustmentFactor "
-                                "(fallback to derived)" if OFFICIAL_RF
-                                else "derived from price only"))
+    log("Odds window: " + str(MIN_ODDS) + " <= back price < " + str(MAX_ODDS))
+    log("Below " + str(MIN_ODDS) + ": alert only if official RF >= "
+        + str(GENUINE_FAV_RF) + "%"
+        + (" (or if RF is unavailable, flagged unverified)"
+           if MIN_ODDS_ALERT_ON_UNKNOWN_RF else " (suppressed if unknown)"))
+    log("RF lookup attempts: " + str(RF_ATTEMPTS))
     log("Polling: " + str(POLL_SECONDS) + "s per market | "
         + str(WORKERS) + " workers | tick " + str(TICK) + "s")
     log("State file: " + STATE_FILE)
@@ -866,7 +935,7 @@ if __name__ == "__main__":
                   + "\nHost: DigitalOcean 139.59.20.81"
                   + "\n" + str(len(registry)) + " races registered, "
                   + str(len(runner_state)) + " runners tracked."
-                  + "\nTrigger: ACTIVE ➜ non-ACTIVE, back price < "
+                  + "\nOdds window: " + str(MIN_ODDS) + " - "
                   + str(MAX_ODDS))
     log("Alerting live.")
 
