@@ -17,21 +17,20 @@ except Exception:
 # ---------------- CONFIG ----------------
 API_BASE = os.environ.get("API_BASE", "http://157.245.44.178/api")
 API_BASE_ALT = os.environ.get("API_BASE_ALT", "http://167.99.82.136/api")
-API_KEY = os.environ.get("API_KEY", "").strip()          # not needed
+API_KEY = os.environ.get("API_KEY", "").strip()
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8949652801:AAFPYHnRXHERi4P28UFJKhqPaVd9RnuVeqI")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "8435489741")
 
 SPORT_ID = 7
-REGIONS = os.environ.get("REGIONS", "ALL")               # "ALL" or "GB,IE,AU"
+REGIONS = os.environ.get("REGIONS", "ALL")
 ALLOWED_REGIONS = (set() if REGIONS.strip().upper() == "ALL"
                    else {r.strip().upper() for r in REGIONS.split(",")
                          if r.strip()})
 
-# ALERT RULE: runner was ACTIVE, is now anything else, and the last
-# fetched FIRST back price is below MAX_ODDS
 MAX_ODDS = float(os.environ.get("MAX_ODDS", "6.0"))
 LAY_FALLBACK = os.environ.get("LAY_FALLBACK", "0") == "1"
+OFFICIAL_RF = os.environ.get("OFFICIAL_RF", "1") == "1"
 
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "30"))
 WORKERS = int(os.environ.get("WORKERS", "16"))
@@ -42,14 +41,14 @@ EVENT_REFETCH_SECONDS = int(os.environ.get("EVENT_REFETCH_SECONDS", "1800"))
 HARD_STOP_AFTER_OFF = 6 * 3600
 EVENT_PAST_CUTOFF = 24 * 3600
 MARKET_PAST_GRACE = 900
-MAX_DAYS_AHEAD = float(os.environ.get("MAX_DAYS_AHEAD", "0"))   # 0 = no limit
+MAX_DAYS_AHEAD = float(os.environ.get("MAX_DAYS_AHEAD", "0"))
 
 STATE_FILE = os.environ.get("STATE_FILE", "/opt/nrbot/nr_state.json")
 STATE_SAVE_EVERY = 20
 RUNNER_STATE_TTL = 4 * 86400
 SEEN_TTL_SECONDS = 4 * 86400
 FAIL_ALERT_AFTER = int(os.environ.get("FAIL_ALERT_AFTER", "6"))
-PROBE_NEW_ENDPOINTS = os.environ.get("PROBE_NEW_ENDPOINTS", "1") == "1"
+PROBE_NEW_ENDPOINTS = os.environ.get("PROBE_NEW_ENDPOINTS", "0") == "1"
 
 UK_TZ = ZoneInfo("Europe/London")
 
@@ -82,7 +81,8 @@ _reg_counter = 0
 _cycle_count = 0
 _active_base = API_BASE
 STATS = {"calls": 0, "errors": 0, "recon_mismatch": 0, "vanished": 0,
-         "filtered_no_price": 0, "filtered_odds": 0, "place_dropped": 0}
+         "filtered_no_price": 0, "filtered_odds": 0, "place_dropped": 0,
+         "official_rf": 0, "derived_rf": 0}
 
 
 def log(msg):
@@ -293,6 +293,42 @@ def first_price(runner, side):
         return None
 
 
+# -------- official Betfair reduction factor, fetched at alert time --------
+def fetch_official_rf(mid, sid):
+    """POST the single marketId to market-listMarketBook and read the
+    runner's adjustmentFactor. Raw Betfair format: no runnerName, prices
+    under ex.availableToBack, and adjustmentFactor per runner."""
+    if not OFFICIAL_RF:
+        return None
+    try:
+        raw = api_post("/racing/market-listMarketBook", {"marketIds": [mid]},
+                       "listMarketBook " + mid)
+    except Exception:
+        return None
+
+    books = raw.get("data") if isinstance(raw, dict) else raw
+    if isinstance(books, dict):
+        books = [books]
+    if not isinstance(books, list):
+        return None
+
+    for b in books:
+        if not isinstance(b, dict):
+            continue
+        if str(g(b, "marketId", default="")) not in ("", str(mid)):
+            continue
+        for r in as_list(g(b, "runners", default=None), "runners"):
+            rid = g(r, "selectionId", "selection_id", "id")
+            if rid is None or str(rid) != str(sid):
+                continue
+            try:
+                af = float(g(r, "adjustmentFactor", "adjustment_factor"))
+            except (TypeError, ValueError):
+                return None
+            return af if af > 0 else None
+    return None
+
+
 # ---------------- state persistence ----------------
 def load_state():
     if not os.path.exists(STATE_FILE):
@@ -346,9 +382,6 @@ def prune_state():
 
 # ---------------- discovery ----------------
 def pick_race_markets(markets, fallback_dt):
-    """market-all-list returns every market for a WHOLE MEETING.
-    One race per distinct marketStartTime; drop place/forecast markets;
-    at each start time keep the market with the most runners."""
     by_time = {}
     skipped = set()
     for m in markets:
@@ -528,7 +561,18 @@ def probe_new_endpoints():
 
 # ---------------- alerting ----------------
 def fire_alert(info, key, name, status, price, price_side, prev):
-    rf = "~{:.1f}%".format((1.0 / float(price)) * 100.0)
+    mid, sid = key.split(":", 1)
+
+    official = fetch_official_rf(mid, sid)
+    if official is not None:
+        STATS["official_rf"] += 1
+        rf_line = ("📉 *Reduction Factor:* `{:.2f}%`".format(official)
+                   + " _(official Betfair)_\n")
+    else:
+        STATS["derived_rf"] += 1
+        rf_line = ("📉 *Reduction Factor:* `~{:.1f}%`".format(
+            (1.0 / float(price)) * 100.0) + " _(derived from price)_\n")
+
     hist = (prev or {}).get("hist", [])
     trend = ""
     if len(hist) >= 2:
@@ -548,14 +592,15 @@ def fire_alert(info, key, name, status, price, price_side, prev):
            + "🏁 *Market:* " + info["market_name"] + "\n"
            + "🔄 *Status:* `ACTIVE ➜ " + status + "`\n"
            + "📊 *" + side_label + ":* `" + fmt(price) + "`\n"
-           + lay_line + trend
-           + "📉 *Reduction Factor:* `" + rf + "`\n"
+           + lay_line + trend + rf_line
            + "🕐 *Price from:* `" + str((prev or {}).get("ts")) + " UTC` ("
            + str(age) + "m before)\n"
            + "⏰ *Race Time:* " + info["race_time"])
 
     log("ALERT: " + name + " @ " + info["race_label"]
-        + " [ACTIVE -> " + status + "] " + price_side + "=" + fmt(price))
+        + " [ACTIVE -> " + status + "] " + price_side + "=" + fmt(price)
+        + " rf=" + ("official " + "{:.2f}".format(official)
+                    if official is not None else "derived"))
     if send_telegram(msg):
         alerted[key] = time.time()
         save_state()
@@ -612,7 +657,6 @@ def process_market(mid, info, odds_raw):
         registry.pop(mid, None)
         return 0
 
-    # place-market safety net: win markets always have exactly one winner
     n_winners = as_int(g(book, "numberOfWinners"))
     if n_winners is not None and n_winners > 1:
         STATS["place_dropped"] += 1
@@ -679,7 +723,6 @@ def process_market(mid, info, odds_raw):
             continue
         alerts += evaluate_transition(info, key, name, status, back, prev)
 
-    # ---- reconciliation ----
     n_total = as_int(g(book, "numberOfRunners"))
     n_active = as_int(g(book, "numberOfActiveRunners"))
     listed = len(listed_ids)
@@ -698,7 +741,6 @@ def process_market(mid, info, odds_raw):
             + str(listed_active) + " ACTIVE listed but "
             + "numberOfActiveRunners=" + str(n_active))
 
-    # ---- a known runner that vanished from a self-consistent payload ----
     if n_total is not None and listed == n_total:
         for sid, name in info["runners"].items():
             if sid in listed_ids:
@@ -764,6 +806,8 @@ def poll_cycle():
         + " place_dropped=" + str(STATS["place_dropped"])
         + " recon=" + str(STATS["recon_mismatch"])
         + " vanished=" + str(STATS["vanished"])
+        + " rf_official=" + str(STATS["official_rf"])
+        + " rf_derived=" + str(STATS["derived_rf"])
         + " runner_statuses=" + str(dict(sorted(_statuses_seen.items())))
         + " market_statuses=" + str(dict(sorted(_mkt_statuses_seen.items())))
         + " api_calls=" + str(STATS["calls"])
@@ -781,6 +825,9 @@ if __name__ == "__main__":
     log("Trigger: runner ACTIVE -> ANY other status, or vanished")
     log("Condition: last fetched FIRST back price < " + str(MAX_ODDS)
         + (" (lay fallback ON)" if LAY_FALLBACK else ""))
+    log("Reduction factor: " + ("official Betfair adjustmentFactor "
+                                "(fallback to derived)" if OFFICIAL_RF
+                                else "derived from price only"))
     log("Polling: " + str(POLL_SECONDS) + "s per market | "
         + str(WORKERS) + " workers | tick " + str(TICK) + "s")
     log("State file: " + STATE_FILE)
