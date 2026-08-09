@@ -32,12 +32,25 @@ if REGIONS.strip().upper() != "ALL":
         if _r:
             ALLOWED_REGIONS.add(_r)
 
-# RF / field-size gate
+# PRIMARY GATE - official Betfair reduction factor decides on its own.
+#   RF >= RF_ALWAYS            -> alert, any field size, any displayed price
+#   RF_FLOOR <= RF < RF_ALWAYS -> alert only if remaining <= RF_MID_MAX_RUNNERS
+#   RF <  RF_FLOOR             -> never alert
 RF_ALWAYS = float(os.environ.get("RF_ALWAYS", "20.0"))
 RF_FLOOR = float(os.environ.get("RF_FLOOR", "16.0"))
 RF_MID_MAX_RUNNERS = int(os.environ.get("RF_MID_MAX_RUNNERS", "8"))
 
-# Per-country lead-time limit, e.g. "US:2" or "US:2,AU:3"
+# FALLBACK ONLY - used when the official RF lookup fails.
+MAX_ODDS = float(os.environ.get("MAX_ODDS", "6.0"))
+MIN_ODDS = float(os.environ.get("MIN_ODDS", "1.20"))
+MIN_ODDS_ALERT_ON_UNKNOWN_RF = os.environ.get("MIN_ODDS_ALERT_ON_UNKNOWN_RF", "1") == "1"
+
+# flag when the displayed price and the official RF disagree badly
+PRICE_MISMATCH_RATIO = float(os.environ.get("PRICE_MISMATCH_RATIO", "1.5"))
+
+RF_ATTEMPTS = int(os.environ.get("RF_ATTEMPTS", "2"))
+STALE_MINUTES = float(os.environ.get("STALE_MINUTES", "15"))
+
 LEAD_LIMITS_RAW = os.environ.get("LEAD_LIMITS", "US:2")
 LEAD_LIMITS = {}
 for _part in LEAD_LIMITS_RAW.split(","):
@@ -51,15 +64,6 @@ for _part in LEAD_LIMITS_RAW.split(","):
         LEAD_LIMITS[_c.strip().upper()] = float(_h.strip()) * 3600.0
     except ValueError:
         pass
-
-MAX_ODDS = float(os.environ.get("MAX_ODDS", "6.0"))
-MIN_ODDS = float(os.environ.get("MIN_ODDS", "1.20"))
-GENUINE_FAV_RF = float(os.environ.get("GENUINE_FAV_RF", "50.0"))
-MIN_ODDS_ALERT_ON_UNKNOWN_RF = os.environ.get("MIN_ODDS_ALERT_ON_UNKNOWN_RF", "1") == "1"
-RF_ATTEMPTS = int(os.environ.get("RF_ATTEMPTS", "2"))
-
-# a stored price older than this means the market has already repriced
-STALE_MINUTES = float(os.environ.get("STALE_MINUTES", "15"))
 
 LAY_FALLBACK = os.environ.get("LAY_FALLBACK", "0") == "1"
 OFFICIAL_RF = os.environ.get("OFFICIAL_RF", "1") == "1"
@@ -117,7 +121,7 @@ STATS = {
     "errors": 0,
     "recon_mismatch": 0,
     "vanished": 0,
-    "filtered_no_price": 0,
+    "filtered_no_signal": 0,
     "filtered_odds": 0,
     "filtered_min_odds": 0,
     "filtered_lead_time": 0,
@@ -126,8 +130,7 @@ STATS = {
     "place_dropped": 0,
     "official_rf": 0,
     "derived_rf": 0,
-    "rf_unknown": 0,
-    "min_odds_override": 0,
+    "price_mismatch": 0,
     "catchup": 0,
 }
 
@@ -721,8 +724,8 @@ def discover():
 
 
 # ---------------- alerting ----------------
-def fire_alert(info, key, name, status, price, side, prev, official,
-               remaining, mkt_matched, unverified):
+def fire_alert(info, key, name, status, price, side, prev, official, rf_used,
+               remaining, mkt_matched, unverified, implied, mismatch):
     now_e = time.time()
 
     prev_epoch = now_e
@@ -754,12 +757,17 @@ def fire_alert(info, key, name, status, price, side, prev, official,
         rf_line = "Reduction Factor: `" + pct(official) + "` (official)\n"
     else:
         STATS["derived_rf"] += 1
-        derived = (1.0 / float(price)) * 100.0
-        rf_line = "Reduction Factor: `~" + pct(derived) + "` (derived)\n"
+        rf_line = "Reduction Factor: `~" + pct(rf_used) + "` (derived)\n"
 
     warn_line = ""
     if unverified:
-        warn_line = "RF unavailable - sub-" + str(MIN_ODDS) + " price unverified\n"
+        warn_line = "Official RF unavailable - figures derived from price\n"
+
+    mismatch_line = ""
+    if mismatch:
+        STATS["price_mismatch"] += 1
+        mismatch_line = "PRICE MISMATCH: shown price is placeholder, RF implies `"
+        mismatch_line += fmt(implied) + "`\n"
 
     trend = ""
     if len(hist) >= 2:
@@ -777,8 +785,10 @@ def fire_alert(info, key, name, status, price, side, prev, official,
         ctry = " [" + info["country"] + "]"
 
     side_label = "Back Price"
-    if side != "back":
+    if side == "lay":
         side_label = "Lay Price (no back seen)"
+    elif side == "implied":
+        side_label = "RF-implied Price (no price seen)"
 
     runners_line = ""
     if remaining is not None:
@@ -797,6 +807,7 @@ def fire_alert(info, key, name, status, price, side, prev, official,
     msg += lay_line
     msg += trend
     msg += rf_line
+    msg += mismatch_line
     msg += warn_line
     msg += stale_line
     msg += runners_line
@@ -805,7 +816,7 @@ def fire_alert(info, key, name, status, price, side, prev, official,
     msg += "Price from: `" + prev_ts + " UTC` (" + str(age) + "m ago)\n"
     msg += "Race Time: " + info["race_time"]
 
-    rf_note = "derived"
+    rf_note = "derived " + pct(rf_used)
     if official is not None:
         rf_note = "official " + pct(official)
 
@@ -815,6 +826,8 @@ def fire_alert(info, key, name, status, price, side, prev, official,
     logline += " runners=" + str(remaining)
     logline += " age=" + str(age) + "m"
     logline += " off_in=" + str(to_off) + "m"
+    if mismatch:
+        logline += " MISMATCH"
     if is_catchup:
         logline += " CATCHUP"
     log(logline)
@@ -829,7 +842,7 @@ def fire_alert(info, key, name, status, price, side, prev, official,
 def evaluate_transition(info, key, name, status, back, prev, remaining, mkt_matched):
     now_e = time.time()
 
-    # lead-time gate first, so a suppressed alert costs no RF lookup
+    # ---- 1. lead-time gate, cheapest check, before any API call ----
     country = str(info.get("country", "")).upper()
     limit = LEAD_LIMITS.get(country)
     if limit is not None:
@@ -844,6 +857,7 @@ def evaluate_transition(info, key, name, status, back, prev, remaining, mkt_matc
             log(msg)
             return 0
 
+    # ---- 2. observed price, may be missing ----
     price = back
     side = "back"
     if not price:
@@ -853,82 +867,88 @@ def evaluate_transition(info, key, name, status, back, prev, remaining, mkt_matc
         if prev:
             price = prev.get("lay")
             side = "lay"
+    if price:
+        price = float(price)
+    else:
+        price = None
 
-    if not price:
-        alerted[key] = now_e
-        STATS["filtered_no_price"] += 1
-        log("FILTERED: " + name + " @ " + info["race_label"] + " - no back price ever stored")
-        return 0
-
-    price = float(price)
-
-    if price >= MAX_ODDS:
-        alerted[key] = now_e
-        STATS["filtered_odds"] += 1
-        msg = "FILTERED: " + name + " @ " + info["race_label"]
-        msg += " - " + side + " " + fmt(price) + " not < " + str(MAX_ODDS)
-        log(msg)
-        return 0
-
+    # ---- 3. official RF ----
     parts = key.split(":", 1)
     mid = parts[0]
     sid = parts[1]
     official = fetch_official_rf(mid, sid)
+
     unverified = False
 
-    # placeholder-price guard below MIN_ODDS
-    if price < MIN_ODDS:
-        if official is not None and official >= GENUINE_FAV_RF:
-            STATS["min_odds_override"] += 1
-            msg = "MIN_ODDS OVERRIDE: " + name + " @ " + info["race_label"]
-            msg += " - " + fmt(price) + " with official RF " + pct(official)
+    if official is not None:
+        # OFFICIAL RF DECIDES. The displayed price is information only -
+        # a placeholder ladder can no longer veto a large reduction factor.
+        rf_used = official
+        rf_src = "official"
+    else:
+        # FALLBACK: no official RF, so the price rules apply instead.
+        unverified = True
+        rf_src = "derived"
+        if price is None:
+            alerted[key] = now_e
+            STATS["filtered_no_signal"] += 1
+            log("FILTERED: " + name + " @ " + info["race_label"] + " - no price and no official RF")
+            return 0
+        if price >= MAX_ODDS:
+            alerted[key] = now_e
+            STATS["filtered_odds"] += 1
+            msg = "FILTERED: " + name + " @ " + info["race_label"]
+            msg += " - no RF, " + side + " " + fmt(price) + " not < " + str(MAX_ODDS)
             log(msg)
-        elif official is None:
-            STATS["rf_unknown"] += 1
+            return 0
+        if price < MIN_ODDS:
             if not MIN_ODDS_ALERT_ON_UNKNOWN_RF:
                 alerted[key] = now_e
                 STATS["filtered_min_odds"] += 1
-                log("FILTERED: " + name + " - below MIN_ODDS and RF unavailable")
+                msg = "FILTERED: " + name + " @ " + info["race_label"]
+                msg += " - no RF and " + fmt(price) + " below " + str(MIN_ODDS)
+                log(msg)
                 return 0
-            unverified = True
-            log("RF UNAVAILABLE: " + name + " - alerting anyway (unverified)")
-        else:
-            alerted[key] = now_e
-            STATS["filtered_min_odds"] += 1
-            msg = "FILTERED: " + name + " @ " + info["race_label"]
-            msg += " - " + fmt(price) + " below " + str(MIN_ODDS)
-            msg += " and official RF " + pct(official) + " - placeholder price"
-            log(msg)
-            return 0
+            log("RF UNAVAILABLE: " + name + " - sub-MIN_ODDS, alerting unverified")
+        rf_used = (1.0 / price) * 100.0
 
-    # RF / field-size gate
-    if official is not None:
-        rf_gate = official
-        rf_src = "official"
-    else:
-        rf_gate = (1.0 / price) * 100.0
-        rf_src = "derived"
-
-    if rf_gate < RF_FLOOR:
+    # ---- 4. RF gate, identical for both paths ----
+    if rf_used < RF_FLOOR:
         alerted[key] = now_e
         STATS["filtered_rf_floor"] += 1
         msg = "FILTERED: " + name + " @ " + info["race_label"]
-        msg += " - RF " + pct(rf_gate) + " (" + rf_src + ") below floor " + str(RF_FLOOR) + "%"
+        msg += " - RF " + pct(rf_used) + " (" + rf_src + ") below floor " + str(RF_FLOOR) + "%"
         log(msg)
         return 0
 
-    if rf_gate < RF_ALWAYS:
+    if rf_used < RF_ALWAYS:
         if remaining is not None and remaining > RF_MID_MAX_RUNNERS:
             alerted[key] = now_e
             STATS["filtered_rf_field"] += 1
             msg = "FILTERED: " + name + " @ " + info["race_label"]
-            msg += " - RF " + pct(rf_gate) + " (" + rf_src + ") mid band but "
+            msg += " - RF " + pct(rf_used) + " (" + rf_src + ") mid band but "
             msg += str(remaining) + " runners left, max " + str(RF_MID_MAX_RUNNERS)
             log(msg)
             return 0
 
+    # ---- 5. price for display, plus mismatch detection ----
+    implied = 0.0
+    if rf_used > 0:
+        implied = 100.0 / rf_used
+
+    mismatch = False
+    if price is None:
+        price = implied
+        side = "implied"
+    elif official is not None and price > 0 and implied > 0:
+        ratio = implied / price
+        if ratio > PRICE_MISMATCH_RATIO:
+            mismatch = True
+        elif ratio < (1.0 / PRICE_MISMATCH_RATIO):
+            mismatch = True
+
     return fire_alert(info, key, name, status, price, side, prev, official,
-                      remaining, mkt_matched, unverified)
+                      rf_used, remaining, mkt_matched, unverified, implied, mismatch)
 
 
 # ---------------- process one market ----------------
@@ -1141,15 +1161,14 @@ def poll_cycle():
     line += " tracked=" + str(len(runner_state))
     line += " alerts=" + str(alerts)
     line += " catchup=" + str(STATS["catchup"])
+    line += " mismatch=" + str(STATS["price_mismatch"])
     line += " failing=" + str(failing)
     line += " lead_time=" + str(STATS["filtered_lead_time"])
     line += " rf_floor=" + str(STATS["filtered_rf_floor"])
     line += " rf_field=" + str(STATS["filtered_rf_field"])
-    line += " no_price=" + str(STATS["filtered_no_price"])
+    line += " no_signal=" + str(STATS["filtered_no_signal"])
     line += " min_odds=" + str(STATS["filtered_min_odds"])
     line += " max_odds=" + str(STATS["filtered_odds"])
-    line += " fav_override=" + str(STATS["min_odds_override"])
-    line += " rf_unknown=" + str(STATS["rf_unknown"])
     line += " place_dropped=" + str(STATS["place_dropped"])
     line += " recon=" + str(STATS["recon_mismatch"])
     line += " vanished=" + str(STATS["vanished"])
@@ -1186,11 +1205,12 @@ def startup_banner():
     else:
         log("Lead-time limits: none")
     log("Trigger: runner ACTIVE -> ANY other status, or vanished")
-    log("RF gate: >=" + str(RF_ALWAYS) + "% any field size")
-    log("RF gate: " + str(RF_FLOOR) + "-" + str(RF_ALWAYS) + "% only if <= " + str(RF_MID_MAX_RUNNERS) + " runners left")
-    log("RF gate: <" + str(RF_FLOOR) + "% never alerts")
-    log("Odds window: " + str(MIN_ODDS) + " <= back price < " + str(MAX_ODDS))
-    log("Stale threshold: alerts older than " + str(STALE_MINUTES) + " min are marked CATCH-UP")
+    log("PRIMARY GATE - official RF decides alone:")
+    log("  RF >= " + str(RF_ALWAYS) + "% -> alert, any field size, any price")
+    log("  RF " + str(RF_FLOOR) + "-" + str(RF_ALWAYS) + "% -> alert only if <= " + str(RF_MID_MAX_RUNNERS) + " runners left")
+    log("  RF < " + str(RF_FLOOR) + "% -> never")
+    log("FALLBACK when RF lookup fails: " + str(MIN_ODDS) + " <= price < " + str(MAX_ODDS))
+    log("Stale threshold: alerts older than " + str(STALE_MINUTES) + " min marked CATCH-UP")
     log("RF lookup attempts: " + str(RF_ATTEMPTS))
     log("Polling: " + str(POLL_SECONDS) + "s per market, " + str(WORKERS) + " workers, tick " + str(TICK) + "s")
     log("State file: " + STATE_FILE)
