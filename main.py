@@ -659,3 +659,578 @@ def discover():
 
             event_meta[eid] = (ev, comp_meta.get(cid, {}), open_dt)
             label = "markets " + str(g(ev, "name", default=eid))
+            market_tasks.append((eid, "/betfair/market-all-list/" + eid,
+                                 label))
+
+    markets_by_event = fetch_many(market_tasks)
+    added = 0
+    for eid in markets_by_event:
+        event_fetched[eid] = now_e
+        raw = markets_by_event[eid]
+        if not raw:
+            continue
+        dump_once("market-all-list", raw)
+        ev, comp, open_dt = event_meta[eid]
+        races, skipped = pick_race_markets(
+            as_list(raw, "markets", "result", "data"), open_dt)
+        for s in skipped:
+            _skipped_names.add(s)
+        for race in races:
+            if register(race, ev, comp):
+                added += 1
+
+    prune_state()
+
+    log("DISCOVER: competitions=" + str(len(comps))
+        + " regions=" + str(sorted(regions))
+        + " events=" + str(total_events)
+        + " skipped_events=" + str(skipped_events)
+        + " markets_fetched=" + str(len(market_tasks))
+        + " new_races=" + str(added)
+        + " registry=" + str(len(registry)))
+
+    if _skipped_names and "skipped" not in _dumps_done:
+        _dumps_done.add("skipped")
+        log("NON-WIN MARKET NAMES EXCLUDED: "
+            + str(sorted(_skipped_names)[:30]))
+
+
+# ---------------- alerting ----------------
+def fire_alert(info, key, name, status, price, side, prev, official,
+               remaining, mkt_matched, unverified):
+    if official is not None:
+        STATS["official_rf"] += 1
+        rf_line = "Reduction Factor: `" + pct(official) + "` (official)\n"
+    else:
+        STATS["derived_rf"] += 1
+        derived = (1.0 / float(price)) * 100.0
+        rf_line = "Reduction Factor: `~" + pct(derived) + "` (derived)\n"
+
+    warn_line = ""
+    if unverified:
+        warn_line = "RF unavailable - sub-" + str(MIN_ODDS) \
+            + " price unverified\n"
+
+    hist = prev.get("hist", []) if prev else []
+    trend = ""
+    if len(hist) >= 2:
+        moves = []
+        for h in hist:
+            moves.append(str(h.get("p")))
+        trend = "Move: `" + " -> ".join(moves) + "`\n"
+
+    prev_epoch = time.time()
+    prev_ts = ""
+    if prev:
+        prev_epoch = prev.get("epoch", prev_epoch)
+        prev_ts = str(prev.get("ts", ""))
+    age = int((time.time() - prev_epoch) / 60)
+    to_off = int((info["race_epoch"] - time.time()) / 60)
+
+    lay_line = ""
+    if prev and prev.get("lay") and side == "back":
+        lay_line = "Lay: `" + fmt(prev.get("lay")) + "`\n"
+
+    ctry = ""
+    if info.get("country"):
+        ctry = " [" + info["country"] + "]"
+
+    if side == "back":
+        side_label = "Back Price"
+    else:
+        side_label = "Lay Price (no back seen)"
+
+    runners_line = ""
+    if remaining is not None:
+        runners_line = "Runners left: " + str(remaining) + "\n"
+
+    matched_line = ""
+    if mkt_matched:
+        matched_line = "Market matched: " + "{:,.0f}".format(mkt_matched) \
+            + "\n"
+
+    msg = "*NON-RUNNER DETECTED*\n\n"
+    msg += "Horse: " + name + "\n"
+    msg += "Race: " + info["race_label"] + ctry + "\n"
+    msg += "Market: " + info["market_name"] + "\n"
+    msg += "Status: `ACTIVE -> " + status + "`\n"
+    msg += side_label + ": `" + fmt(price) + "`\n"
+    msg += lay_line
+    msg += trend
+    msg += rf_line
+    msg += warn_line
+    msg += runners_line
+    msg += matched_line
+    msg += "Off in: ~" + str(to_off) + " min\n"
+    msg += "Price from: `" + prev_ts + " UTC` (" + str(age) + "m before)\n"
+    msg += "Race Time: " + info["race_time"]
+
+    if official is not None:
+        rf_note = "official " + pct(official)
+    else:
+        rf_note = "derived"
+    log("ALERT: " + name + " @ " + info["race_label"]
+        + " [ACTIVE -> " + status + "] " + side + "=" + fmt(price)
+        + " rf=" + rf_note
+        + " runners=" + str(remaining)
+        + " off_in=" + str(to_off) + "m")
+
+    if send_telegram(msg):
+        alerted[key] = time.time()
+        save_state()
+        return 1
+    return 0
+
+
+def evaluate_transition(info, key, name, status, back, prev,
+                        remaining, mkt_matched):
+    # ---- lead-time gate: cheapest check, runs first ----
+    country = str(info.get("country", "")).upper()
+    limit = LEAD_LIMITS.get(country)
+    if limit is not None:
+        to_off = info["race_epoch"] - time.time()
+        if to_off > limit:
+            alerted[key] = time.time()
+            STATS["filtered_lead_time"] += 1
+            log("FILTERED: " + name + " @ " + info["race_label"]
+                + " - " + country + " race starts in "
+                + "{:.1f}".format(to_off / 3600.0) + "h, limit "
+                + "{:.1f}".format(limit / 3600.0) + "h")
+            return 0
+
+    price = back
+    side = "back"
+    if not price and prev:
+        price = prev.get("back")
+    if not price and LAY_FALLBACK and prev:
+        price = prev.get("lay")
+        side = "lay"
+
+    if not price:
+        alerted[key] = time.time()
+        STATS["filtered_no_price"] += 1
+        log("FILTERED: " + name + " @ " + info["race_label"]
+            + " - no back price ever stored")
+        return 0
+
+    price = float(price)
+
+    if price >= MAX_ODDS:
+        alerted[key] = time.time()
+        STATS["filtered_odds"] += 1
+        log("FILTERED: " + name + " @ " + info["race_label"]
+            + " - " + side + " " + fmt(price) + " not < " + str(MAX_ODDS))
+        return 0
+
+    parts = key.split(":", 1)
+    mid = parts[0]
+    sid = parts[1]
+    official = fetch_official_rf(mid, sid)
+    unverified = False
+
+    # ---- sub-MIN_ODDS placeholder guard ----
+    if price < MIN_ODDS:
+        if official is not None and official >= GENUINE_FAV_RF:
+            STATS["min_odds_override"] += 1
+            log("MIN_ODDS OVERRIDE: " + name + " @ " + info["race_label"]
+                + " - " + fmt(price) + " with official RF " + pct(official)
+                + " = genuine odds-on favourite")
+        elif official is None:
+            STATS["rf_unknown"] += 1
+            if not MIN_ODDS_ALERT_ON_UNKNOWN_RF:
+                alerted[key] = time.time()
+                STATS["filtered_min_odds"] += 1
+                log("FILTERED: " + name + " @ " + info["race_label"]
+                    + " - " + fmt(price) + " below " + str(MIN_ODDS)
+                    + " and RF unavailable")
+                return 0
+            unverified = True
+            log("RF UNAVAILABLE: " + name + " @ " + info["race_label"]
+                + " - " + fmt(price) + " below " + str(MIN_ODDS)
+                + ", alerting anyway")
+        else:
+            alerted[key] = time.time()
+            STATS["filtered_min_odds"] += 1
+            log("FILTERED: " + name + " @ " + info["race_label"]
+                + " - " + fmt(price) + " below " + str(MIN_ODDS)
+                + " and official RF " + pct(official)
+                + " - placeholder price")
+            return 0
+
+    # ---- RF / field-size gate ----
+    if official is not None:
+        rf_gate = official
+        rf_src = "official"
+    else:
+        rf_gate = (1.0 / price) * 100.0
+        rf_src = "derived"
+
+    if rf_gate < RF_FLOOR:
+        alerted[key] = time.time()
+        STATS["filtered_rf_floor"] += 1
+        log("FILTERED: " + name + " @ " + info["race_label"]
+            + " - RF " + pct(rf_gate) + " (" + rf_src
+            + ") below floor " + str(RF_FLOOR) + "%")
+        return 0
+
+    if rf_gate < RF_ALWAYS:
+        if remaining is not None and remaining > RF_MID_MAX_RUNNERS:
+            alerted[key] = time.time()
+            STATS["filtered_rf_field"] += 1
+            log("FILTERED: " + name + " @ " + info["race_label"]
+                + " - RF " + pct(rf_gate) + " (" + rf_src + ") in mid band"
+                + " but " + str(remaining) + " runners left, max "
+                + str(RF_MID_MAX_RUNNERS))
+            return 0
+
+    return fire_alert(info, key, name, status, price, side, prev,
+                      official, remaining, mkt_matched, unverified)
+
+
+# ---------------- process one market ----------------
+def process_market(mid, info, odds_raw):
+    if odds_raw is None:
+        market_fail[mid] = market_fail.get(mid, 0) + 1
+        n = market_fail[mid]
+        if n == FAIL_ALERT_AFTER and mid not in fail_warned:
+            fail_warned.add(mid)
+            log("MARKET FAILING: " + info["race_label"] + " " + mid
+                + " - " + str(n) + " consecutive fetch failures")
+            send_telegram("*Market not responding*\n" + info["race_label"]
+                          + "\n`" + mid + "` - " + str(n)
+                          + " consecutive failures, currently unwatched.")
+        return 0
+    market_fail[mid] = 0
+
+    dump_once("market-odds", odds_raw)
+    book = unwrap(odds_raw)
+
+    mkt_status = str(g(book, "status", default="") or "").upper()
+    if mkt_status:
+        _mkt_statuses_seen[mkt_status] = _mkt_statuses_seen.get(
+            mkt_status, 0) + 1
+    if mkt_status in DEAD_MARKET_STATUSES:
+        registry.pop(mid, None)
+        return 0
+
+    n_winners = as_int(g(book, "numberOfWinners"))
+    if n_winners is not None and n_winners > 1:
+        STATS["place_dropped"] += 1
+        log("PLACE MARKET DROPPED: " + info["race_label"] + " "
+            + info["market_name"] + " numberOfWinners=" + str(n_winners))
+        registry.pop(mid, None)
+        return 0
+
+    runners = as_list(g(book, "runners", default=None), "runners")
+    if not runners:
+        return 0
+
+    n_total = as_int(g(book, "numberOfRunners"))
+    n_active = as_int(g(book, "numberOfActiveRunners"))
+    try:
+        mkt_matched = float(g(book, "totalMatched", "total_matched",
+                              default=0) or 0)
+    except (TypeError, ValueError):
+        mkt_matched = 0.0
+
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    now_e = time.time()
+    alerts = 0
+    listed_ids = set()
+    listed_active = 0
+
+    for r in runners:
+        sid = g(r, "selectionId", "selection_id", "id")
+        if sid is None:
+            continue
+        sid = str(sid)
+        listed_ids.add(sid)
+        key = mid + ":" + sid
+
+        name = info["runners"].get(sid)
+        if not name:
+            name = str(g(r, "runnerName", "name",
+                         default="Selection " + sid))
+
+        status = str(g(r, "status", default="") or "").upper().strip()
+        if status:
+            _statuses_seen[status] = _statuses_seen.get(status, 0) + 1
+        if status == "ACTIVE":
+            listed_active += 1
+
+        back = first_price(r, "back")
+        lay = first_price(r, "lay")
+        prev = runner_state.get(key)
+
+        if status == "ACTIVE":
+            hist = []
+            if prev:
+                hist = prev.get("hist", [])
+            if back:
+                hist = hist + [{"t": now_utc.strftime("%H:%M"),
+                                "p": round(back, 2)}]
+            keep_back = back
+            if not keep_back and prev:
+                keep_back = prev.get("back")
+            keep_lay = lay
+            if not keep_lay and prev:
+                keep_lay = prev.get("lay")
+            runner_state[key] = {
+                "status": status,
+                "back": keep_back,
+                "lay": keep_lay,
+                "ts": now_utc.strftime("%d-%b %H:%M:%S"),
+                "epoch": now_e,
+                "hist": hist[-5:],
+            }
+            continue
+
+        if prev is None:
+            runner_state[key] = {
+                "status": status,
+                "back": back,
+                "lay": lay,
+                "ts": now_utc.strftime("%d-%b %H:%M:%S"),
+                "epoch": now_e,
+                "hist": [],
+            }
+            continue
+
+        was = prev.get("status")
+        runner_state[key]["status"] = status
+        runner_state[key]["epoch"] = now_e
+        if was != "ACTIVE":
+            continue
+        if key in alerted:
+            continue
+        alerts += evaluate_transition(info, key, name, status, back, prev,
+                                      n_active, mkt_matched)
+
+    listed = len(listed_ids)
+
+    if n_total is not None and listed != n_total:
+        if mid not in recon_warned:
+            recon_warned.add(mid)
+            STATS["recon_mismatch"] += 1
+            log("RECON MISMATCH: " + info["race_label"] + " " + mid
+                + " - payload lists " + str(listed)
+                + " runners but numberOfRunners=" + str(n_total))
+    if n_active is not None and listed_active != n_active:
+        if mid not in recon_warned:
+            recon_warned.add(mid)
+            STATS["recon_mismatch"] += 1
+            log("RECON MISMATCH: " + info["race_label"] + " " + mid
+                + " - " + str(listed_active) + " ACTIVE listed but "
+                + "numberOfActiveRunners=" + str(n_active))
+
+    if n_total is not None and listed == n_total:
+        for sid in info["runners"]:
+            if sid in listed_ids:
+                continue
+            key = mid + ":" + sid
+            prev = runner_state.get(key)
+            if not prev:
+                continue
+            if prev.get("status") != "ACTIVE":
+                continue
+            if key in alerted:
+                continue
+            name = info["runners"][sid]
+            STATS["vanished"] += 1
+            log("VANISHED: " + name + " @ " + info["race_label"]
+                + " - was ACTIVE, no longer listed")
+            runner_state[key]["status"] = "VANISHED"
+            runner_state[key]["epoch"] = now_e
+            alerts += evaluate_transition(info, key, name, "VANISHED",
+                                          None, prev, n_active, mkt_matched)
+    return alerts
+
+
+def poll_cycle():
+    global _cycle_count
+    now_e = time.time()
+    if now_e < _rate_limited_until:
+        return
+
+    due = []
+    for mid in registry:
+        info = registry[mid]
+        if info["race_epoch"] - now_e < -HARD_STOP_AFTER_OFF:
+            continue
+        if now_e - info["last_poll"] < POLL_SECONDS:
+            continue
+        due.append(mid)
+    if not due:
+        return
+
+    for mid in due:
+        registry[mid]["last_poll"] = now_e
+
+    tasks = []
+    for mid in due:
+        tasks.append((mid, "/racing/market-odds/" + mid, "odds " + mid))
+    results = fetch_many(tasks)
+
+    alerts = 0
+    for mid in results:
+        info = registry.get(mid)
+        if info:
+            alerts += process_market(mid, info, results[mid])
+
+    expired = []
+    for mid in registry:
+        if now_e > registry[mid]["race_epoch"] + HARD_STOP_AFTER_OFF:
+            expired.append(mid)
+    for mid in expired:
+        registry.pop(mid, None)
+
+    _cycle_count += 1
+    if _cycle_count % STATE_SAVE_EVERY == 0:
+        save_state()
+
+    failing = 0
+    for n in market_fail.values():
+        if n >= FAIL_ALERT_AFTER:
+            failing += 1
+
+    log("CYCLE: polled=" + str(len(due))
+        + " registry=" + str(len(registry))
+        + " tracked=" + str(len(runner_state))
+        + " alerts=" + str(alerts)
+        + " failing=" + str(failing)
+        + " lead_time=" + str(STATS["filtered_lead_time"])
+        + " rf_floor=" + str(STATS["filtered_rf_floor"])
+        + " rf_field=" + str(STATS["filtered_rf_field"])
+        + " no_price=" + str(STATS["filtered_no_price"])
+        + " min_odds=" + str(STATS["filtered_min_odds"])
+        + " max_odds=" + str(STATS["filtered_odds"])
+        + " fav_override=" + str(STATS["min_odds_override"])
+        + " rf_unknown=" + str(STATS["rf_unknown"])
+        + " place_dropped=" + str(STATS["place_dropped"])
+        + " recon=" + str(STATS["recon_mismatch"])
+        + " vanished=" + str(STATS["vanished"])
+        + " rf_official=" + str(STATS["official_rf"])
+        + " rf_derived=" + str(STATS["derived_rf"])
+        + " statuses=" + str(dict(sorted(_statuses_seen.items())))
+        + " mkt_statuses=" + str(dict(sorted(_mkt_statuses_seen.items())))
+        + " api_calls=" + str(STATS["calls"])
+        + " api_errors=" + str(STATS["errors"]))
+
+
+def startup_banner():
+    log("=== NON-RUNNER MONITOR - PRODUCTION (DigitalOcean) ===")
+    log("Base: " + API_BASE + "  alt " + API_BASE_ALT)
+    if API_KEY:
+        log("Auth header: sent")
+    else:
+        log("Auth header: NOT sent (no key)")
+
+    if ALLOWED_REGIONS:
+        log("Regions: " + str(sorted(ALLOWED_REGIONS)))
+    else:
+        log("Regions: ALL")
+
+    if MAX_DAYS_AHEAD > 0:
+        log("Days ahead: " + str(MAX_DAYS_AHEAD))
+    else:
+        log("Days ahead: unlimited")
+
+    if LEAD_LIMITS:
+        parts = []
+        for k in sorted(LEAD_LIMITS):
+            hours = LEAD_LIMITS[k] / 3600.0
+            parts.append(k + " within " + "{:.1f}".format(hours) + "h")
+        log("Lead-time limits: " + ", ".join(parts))
+    else:
+        log("Lead-time limits: none")
+
+    log("Trigger: runner ACTIVE -> ANY other status, or vanished")
+    log("RF gate: >=" + str(RF_ALWAYS) + "% any field size")
+    log("RF gate: " + str(RF_FLOOR) + "-" + str(RF_ALWAYS)
+        + "% only if <= " + str(RF_MID_MAX_RUNNERS) + " runners left")
+    log("RF gate: <" + str(RF_FLOOR) + "% never alerts")
+    log("Odds window: " + str(MIN_ODDS) + " <= back price < "
+        + str(MAX_ODDS))
+    if MIN_ODDS_ALERT_ON_UNKNOWN_RF:
+        unk = "alert (flagged unverified)"
+    else:
+        unk = "suppress"
+    log("Below " + str(MIN_ODDS) + ": alert only if official RF >= "
+        + str(GENUINE_FAV_RF) + "%; if RF unknown -> " + unk)
+    log("RF lookup attempts: " + str(RF_ATTEMPTS))
+    log("Polling: " + str(POLL_SECONDS) + "s per market, "
+        + str(WORKERS) + " workers, tick " + str(TICK) + "s")
+    log("State file: " + STATE_FILE)
+
+
+def startup_telegram(had_state):
+    if had_state:
+        state_note = "(state restored)"
+    else:
+        state_note = "(cold start)"
+    lead_note = ""
+    if LEAD_LIMITS:
+        lead_note = "\nLead limit: " + LEAD_LIMITS_RAW
+    msg = "Non-runner monitor LIVE " + state_note
+    msg += "\nHost: DigitalOcean 139.59.20.81"
+    msg += "\n" + str(len(registry)) + " races registered, "
+    msg += str(len(runner_state)) + " runners tracked."
+    msg += "\nRF gate: >=" + str(RF_ALWAYS) + "% any | "
+    msg += str(RF_FLOOR) + "-" + str(RF_ALWAYS) + "% if <= "
+    msg += str(RF_MID_MAX_RUNNERS) + " runners"
+    msg += lead_note
+    send_telegram(msg)
+
+
+if __name__ == "__main__":
+    startup_banner()
+    load_state()
+    choose_base()
+
+    log("Initial discovery...")
+    try:
+        discover()
+    except Exception as e:
+        err("Initial discovery failed: " + str(e), e)
+
+    had_state = len(runner_state) > 0
+    if had_state:
+        log("Reconciling against restored state...")
+    else:
+        log("Baseline sweep...")
+
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        try:
+            poll_cycle()
+        except Exception as e:
+            err("Baseline error: " + str(e), e)
+        if registry:
+            all_polled = True
+            for v in registry.values():
+                if time.time() - v["last_poll"] >= POLL_SECONDS:
+                    all_polled = False
+                    break
+            if all_polled:
+                break
+        time.sleep(TICK)
+    save_state()
+
+    startup_telegram(had_state)
+    log("Alerting live.")
+
+    last_discover = time.time()
+    while True:
+        try:
+            poll_cycle()
+            if time.time() - last_discover >= DISCOVER_SECONDS:
+                last_discover = time.time()
+                discover()
+                save_state()
+        except KeyboardInterrupt:
+            save_state()
+            log("Stopped.")
+            break
+        except Exception as e:
+            err("Loop error: " + str(e), e)
+        time.sleep(TICK)
