@@ -23,26 +23,21 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8949652801:AAFPYHnRXH
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "8435489741")
 
 SPORT_ID = 7
+
 REGIONS = os.environ.get("REGIONS", "ALL")
-if REGIONS.strip().upper() == "ALL":
-    ALLOWED_REGIONS = set()
-else:
-    ALLOWED_REGIONS = set()
+ALLOWED_REGIONS = set()
+if REGIONS.strip().upper() != "ALL":
     for _r in REGIONS.split(","):
         _r = _r.strip().upper()
         if _r:
             ALLOWED_REGIONS.add(_r)
 
-# ---- RF / field-size gate ----
-#   RF >= RF_ALWAYS            -> alert, any field size
-#   RF_FLOOR <= RF < RF_ALWAYS -> alert only if remaining <= RF_MID_MAX_RUNNERS
-#   RF <  RF_FLOOR             -> never alert
+# RF / field-size gate
 RF_ALWAYS = float(os.environ.get("RF_ALWAYS", "20.0"))
 RF_FLOOR = float(os.environ.get("RF_FLOOR", "16.0"))
 RF_MID_MAX_RUNNERS = int(os.environ.get("RF_MID_MAX_RUNNERS", "8"))
 
-# Per-country lead-time limit: alert only if the race starts within N hours.
-# Format "US:2" or "US:2,AU:3". Countries not listed have no limit.
+# Per-country lead-time limit, e.g. "US:2" or "US:2,AU:3"
 LEAD_LIMITS_RAW = os.environ.get("LEAD_LIMITS", "US:2")
 LEAD_LIMITS = {}
 for _part in LEAD_LIMITS_RAW.split(","):
@@ -60,9 +55,11 @@ for _part in LEAD_LIMITS_RAW.split(","):
 MAX_ODDS = float(os.environ.get("MAX_ODDS", "6.0"))
 MIN_ODDS = float(os.environ.get("MIN_ODDS", "1.20"))
 GENUINE_FAV_RF = float(os.environ.get("GENUINE_FAV_RF", "50.0"))
-MIN_ODDS_ALERT_ON_UNKNOWN_RF = os.environ.get(
-    "MIN_ODDS_ALERT_ON_UNKNOWN_RF", "1") == "1"
+MIN_ODDS_ALERT_ON_UNKNOWN_RF = os.environ.get("MIN_ODDS_ALERT_ON_UNKNOWN_RF", "1") == "1"
 RF_ATTEMPTS = int(os.environ.get("RF_ATTEMPTS", "2"))
+
+# a stored price older than this means the market has already repriced
+STALE_MINUTES = float(os.environ.get("STALE_MINUTES", "15"))
 
 LAY_FALLBACK = os.environ.get("LAY_FALLBACK", "0") == "1"
 OFFICIAL_RF = os.environ.get("OFFICIAL_RF", "1") == "1"
@@ -131,6 +128,7 @@ STATS = {
     "derived_rf": 0,
     "rf_unknown": 0,
     "min_odds_override": 0,
+    "catchup": 0,
 }
 
 
@@ -148,24 +146,24 @@ def err(msg, exc=None):
 # ---------------- telegram ----------------
 def send_telegram(message):
     url = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendMessage"
-    body = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message[:4000],
-        "parse_mode": "Markdown",
-    }
+    body = {}
+    body["chat_id"] = TELEGRAM_CHAT_ID
+    body["text"] = message[:4000]
+    body["parse_mode"] = "Markdown"
     payload = json.dumps(body).encode("utf-8")
-    for attempt in range(3):
+    headers = {"Content-Type": "application/json"}
+    attempt = 0
+    while attempt < 3:
+        attempt += 1
         try:
-            req = urllib.request.Request(
-                url, data=payload,
-                headers={"Content-Type": "application/json"})
+            req = urllib.request.Request(url, data=payload, headers=headers)
             resp = urllib.request.urlopen(req, timeout=15)
             code = resp.status
             resp.close()
             if code == 200:
                 return True
         except Exception as e:
-            err("Telegram error " + str(attempt + 1) + "/3: " + str(e))
+            err("Telegram error " + str(attempt) + "/3: " + str(e))
             time.sleep(2)
     return False
 
@@ -185,8 +183,10 @@ def dump_once(tag, obj, limit=1800):
 
 
 # ---------------- api ----------------
-def _headers():
-    h = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
+def build_headers():
+    h = {}
+    h["Accept"] = "application/json"
+    h["User-Agent"] = "Mozilla/5.0"
     if API_KEY:
         h["sportbex-api-key"] = API_KEY
     return h
@@ -194,7 +194,8 @@ def _headers():
 
 def api_get(path, label):
     global _rate_limited_until
-    req = urllib.request.Request(_active_base + path, headers=_headers())
+    url = _active_base + path
+    req = urllib.request.Request(url, headers=build_headers())
     STATS["calls"] += 1
     try:
         resp = urllib.request.urlopen(req, timeout=25)
@@ -220,11 +221,11 @@ def api_get(path, label):
 
 
 def api_post(path, body, label):
+    url = _active_base + path
     data = json.dumps(body).encode("utf-8")
-    h = _headers()
+    h = build_headers()
     h["Content-Type"] = "application/json"
-    req = urllib.request.Request(_active_base + path, data=data,
-                                 headers=h, method="POST")
+    req = urllib.request.Request(url, data=data, headers=h, method="POST")
     STATS["calls"] += 1
     try:
         resp = urllib.request.urlopen(req, timeout=25)
@@ -246,8 +247,12 @@ def fetch_many(tasks):
         workers = len(tasks)
     ex = ThreadPoolExecutor(max_workers=workers)
     futures = {}
-    for key, path, label in tasks:
-        futures[ex.submit(api_get, path, label)] = key
+    for item in tasks:
+        key = item[0]
+        path = item[1]
+        label = item[2]
+        fut = ex.submit(api_get, path, label)
+        futures[fut] = key
     for fut in futures:
         key = futures[fut]
         try:
@@ -279,8 +284,9 @@ def g(d, *keys, **kw):
     if not isinstance(d, dict):
         return default
     for k in keys:
-        if k in d and d[k] is not None:
-            return d[k]
+        if k in d:
+            if d[k] is not None:
+                return d[k]
     return default
 
 
@@ -293,8 +299,9 @@ def as_list(obj, *container_keys):
             if isinstance(v, list):
                 return v
         for v in obj.values():
-            if isinstance(v, list) and v and isinstance(v[0], dict):
-                return v
+            if isinstance(v, list):
+                if v and isinstance(v[0], dict):
+                    return v
     return []
 
 
@@ -303,19 +310,22 @@ def unwrap(payload):
         d = payload.get("data")
         if isinstance(d, dict):
             return d
-        if isinstance(d, list) and d and isinstance(d[0], dict):
-            return d[0]
+        if isinstance(d, list):
+            if d and isinstance(d[0], dict):
+                return d[0]
         return payload
-    if isinstance(payload, list) and payload and isinstance(payload[0], dict):
-        return payload[0]
+    if isinstance(payload, list):
+        if payload and isinstance(payload[0], dict):
+            return payload[0]
     return {}
 
 
 def parse_iso(ts):
     if not ts:
         return None
+    text = str(ts).replace("Z", "+00:00")
     try:
-        return datetime.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        return datetime.datetime.fromisoformat(text)
     except ValueError:
         return None
 
@@ -366,11 +376,13 @@ def first_price(runner, side):
         return None
 
 
-# -------- official Betfair reduction factor (retried) --------
-def _rf_once(mid, sid):
-    raw = api_post("/racing/market-listMarketBook", {"marketIds": [mid]},
-                   "listMarketBook " + mid)
-    books = raw.get("data") if isinstance(raw, dict) else raw
+# ---------------- official Betfair reduction factor ----------------
+def rf_once(mid, sid):
+    body = {"marketIds": [mid]}
+    raw = api_post("/racing/market-listMarketBook", body, "listMarketBook")
+    books = raw
+    if isinstance(raw, dict):
+        books = raw.get("data")
     if isinstance(books, dict):
         books = [books]
     if not isinstance(books, list):
@@ -398,29 +410,28 @@ def _rf_once(mid, sid):
 
 
 def fetch_official_rf(mid, sid):
-    """Retried, because a failed lookup would otherwise suppress the
-    single most valuable alert: a genuine odds-on favourite withdrawn."""
     if not OFFICIAL_RF:
         return None
     attempts = RF_ATTEMPTS
     if attempts < 1:
         attempts = 1
-    for attempt in range(attempts):
+    attempt = 0
+    while attempt < attempts:
+        attempt += 1
         af = None
         try:
-            af = _rf_once(mid, sid)
+            af = rf_once(mid, sid)
         except Exception as e:
-            if attempt + 1 >= attempts:
-                err("RF lookup failed after " + str(attempts)
-                    + " attempts " + mid + ":" + sid + " - " + str(e))
+            if attempt >= attempts:
+                err("RF lookup failed after " + str(attempts) + " tries: " + str(e))
         if af is not None:
             return af
-        if attempt + 1 < attempts:
+        if attempt < attempts:
             time.sleep(1.0)
     return None
 
 
-# ---------------- state persistence ----------------
+# ---------------- state ----------------
 def load_state():
     if not os.path.exists(STATE_FILE):
         log("No state file - cold start (first run will baseline).")
@@ -430,25 +441,28 @@ def load_state():
         d = json.load(f)
         f.close()
         now = time.time()
-        for k, v in (d.get("alerted") or {}).items():
+        saved = d.get("alerted") or {}
+        for k in saved:
             try:
-                if now - float(v) < SEEN_TTL_SECONDS:
-                    alerted[str(k)] = float(v)
-            except Exception:
+                v = float(saved[k])
+            except (TypeError, ValueError):
                 continue
+            if now - v < SEEN_TTL_SECONDS:
+                alerted[str(k)] = v
         kept = 0
-        for k, v in (d.get("runner_state") or {}).items():
+        rs = d.get("runner_state") or {}
+        for k in rs:
+            v = rs[k]
             if not isinstance(v, dict):
                 continue
             try:
-                if now - float(v.get("epoch", 0)) < RUNNER_STATE_TTL:
-                    runner_state[str(k)] = v
-                    kept += 1
-            except Exception:
+                epoch = float(v.get("epoch", 0))
+            except (TypeError, ValueError):
                 continue
-        log("State restored: " + str(len(alerted)) + " alerted, "
-            + str(kept) + " runner statuses - transitions during "
-            + "downtime will still alert.")
+            if now - epoch < RUNNER_STATE_TTL:
+                runner_state[str(k)] = v
+                kept += 1
+        log("State restored: " + str(len(alerted)) + " alerted, " + str(kept) + " runner statuses")
     except Exception as e:
         err("State load failed: " + str(e), e)
 
@@ -467,14 +481,18 @@ def save_state():
 def prune_state():
     now = time.time()
     stale = []
-    for k, v in runner_state.items():
-        if now - float(v.get("epoch", now)) > RUNNER_STATE_TTL:
+    for k in runner_state:
+        try:
+            epoch = float(runner_state[k].get("epoch", now))
+        except (TypeError, ValueError):
+            epoch = now
+        if now - epoch > RUNNER_STATE_TTL:
             stale.append(k)
     for k in stale:
         runner_state.pop(k, None)
     old = []
-    for k, t in alerted.items():
-        if now - float(t) > SEEN_TTL_SECONDS:
+    for k in alerted:
+        if now - float(alerted[k]) > SEEN_TTL_SECONDS:
             old.append(k)
     for k in old:
         alerted.pop(k, None)
@@ -508,28 +526,29 @@ def pick_race_markets(markets, fallback_dt):
             sid = g(r, "selectionId", "selection_id", "id")
             if sid is None:
                 continue
-            rname = str(g(r, "runnerName", "runner_name", "name",
-                          default="Selection " + str(sid)))
+            rname = str(g(r, "runnerName", "runner_name", "name", default="Selection " + str(sid)))
             meta = g(r, "metadata", default={}) or {}
             cloth = str(g(meta, "CLOTH_NUMBER", default="") or "").strip()
-            if cloth and not rname.lstrip().startswith(cloth):
-                rname = cloth + " " + rname
+            if cloth:
+                if not rname.lstrip().startswith(cloth):
+                    rname = cloth + " " + rname
             runners[str(sid)] = rname
 
+        key = str(mid)
         if mstart is not None:
             key = mstart.isoformat()
-        else:
-            key = str(mid)
-        cand = {
-            "market_id": str(mid),
-            "market_name": mname,
-            "runners": runners,
-            "start": mstart,
-        }
+
+        cand = {}
+        cand["market_id"] = str(mid)
+        cand["market_name"] = mname
+        cand["runners"] = runners
+        cand["start"] = mstart
+
         if key not in by_time:
             by_time[key] = cand
         elif len(runners) > len(by_time[key]["runners"]):
             by_time[key] = cand
+
     return list(by_time.values()), skipped
 
 
@@ -571,25 +590,25 @@ def register(market, event, competition):
 
     _reg_counter += 1
     now_e = time.time()
-    registry[mid] = {
-        "event_id": str(g(event, "id", "eventId", default="")),
-        "race_label": race_label,
-        "market_name": market["market_name"],
-        "venue": venue,
-        "country": country.upper(),
-        "race_epoch": race_epoch,
-        "race_time": race_time,
-        "runners": market["runners"],
-        "last_poll": now_e - POLL_SECONDS + (_reg_counter % POLL_SECONDS),
-    }
+
+    entry = {}
+    entry["event_id"] = str(g(event, "id", "eventId", default=""))
+    entry["race_label"] = race_label
+    entry["market_name"] = market["market_name"]
+    entry["venue"] = venue
+    entry["country"] = country.upper()
+    entry["race_epoch"] = race_epoch
+    entry["race_time"] = race_time
+    entry["runners"] = market["runners"]
+    entry["last_poll"] = now_e - POLL_SECONDS + (_reg_counter % POLL_SECONDS)
+    registry[mid] = entry
     return True
 
 
 def discover():
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     try:
-        comps_raw = api_get("/betfair/competition-list/" + str(SPORT_ID),
-                            "competition-list")
+        comps_raw = api_get("/betfair/competition-list/" + str(SPORT_ID), "competition-list")
     except Exception:
         err("DISCOVERY ABORTED - competition-list unavailable this round")
         return
@@ -599,6 +618,7 @@ def discover():
     comp_tasks = []
     comp_meta = {}
     regions = set()
+
     for c in comps:
         comp = g(c, "competition", default=c) or {}
         cid = g(comp, "id", "competitionId")
@@ -610,8 +630,9 @@ def discover():
             regions.add(region)
         else:
             regions.add("?")
-        if ALLOWED_REGIONS and region.upper() not in ALLOWED_REGIONS:
-            continue
+        if ALLOWED_REGIONS:
+            if region.upper() not in ALLOWED_REGIONS:
+                continue
         comp_meta[cid] = comp
         cname = str(g(comp, "name", default=cid))
         path = "/betfair/racing-event-list/" + str(SPORT_ID) + "/" + cid
@@ -628,6 +649,7 @@ def discover():
     now_e = time.time()
     total_events = 0
     skipped_events = 0
+
     for cid in events_by_comp:
         raw = events_by_comp[cid]
         if not raw:
@@ -659,20 +681,22 @@ def discover():
 
             event_meta[eid] = (ev, comp_meta.get(cid, {}), open_dt)
             label = "markets " + str(g(ev, "name", default=eid))
-            market_tasks.append((eid, "/betfair/market-all-list/" + eid,
-                                 label))
+            market_tasks.append((eid, "/betfair/market-all-list/" + eid, label))
 
     markets_by_event = fetch_many(market_tasks)
     added = 0
+
     for eid in markets_by_event:
         event_fetched[eid] = now_e
         raw = markets_by_event[eid]
         if not raw:
             continue
         dump_once("market-all-list", raw)
-        ev, comp, open_dt = event_meta[eid]
-        races, skipped = pick_race_markets(
-            as_list(raw, "markets", "result", "data"), open_dt)
+        meta = event_meta[eid]
+        ev = meta[0]
+        comp = meta[1]
+        open_dt = meta[2]
+        races, skipped = pick_race_markets(as_list(raw, "markets", "result", "data"), open_dt)
         for s in skipped:
             _skipped_names.add(s)
         for race in races:
@@ -681,23 +705,50 @@ def discover():
 
     prune_state()
 
-    log("DISCOVER: competitions=" + str(len(comps))
-        + " regions=" + str(sorted(regions))
-        + " events=" + str(total_events)
-        + " skipped_events=" + str(skipped_events)
-        + " markets_fetched=" + str(len(market_tasks))
-        + " new_races=" + str(added)
-        + " registry=" + str(len(registry)))
+    line = "DISCOVER: competitions=" + str(len(comps))
+    line += " regions=" + str(sorted(regions))
+    line += " events=" + str(total_events)
+    line += " skipped_events=" + str(skipped_events)
+    line += " markets_fetched=" + str(len(market_tasks))
+    line += " new_races=" + str(added)
+    line += " registry=" + str(len(registry))
+    log(line)
 
-    if _skipped_names and "skipped" not in _dumps_done:
-        _dumps_done.add("skipped")
-        log("NON-WIN MARKET NAMES EXCLUDED: "
-            + str(sorted(_skipped_names)[:30]))
+    if _skipped_names:
+        if "skipped" not in _dumps_done:
+            _dumps_done.add("skipped")
+            log("NON-WIN MARKET NAMES EXCLUDED: " + str(sorted(_skipped_names)[:30]))
 
 
 # ---------------- alerting ----------------
 def fire_alert(info, key, name, status, price, side, prev, official,
                remaining, mkt_matched, unverified):
+    now_e = time.time()
+
+    prev_epoch = now_e
+    prev_ts = ""
+    prev_lay = None
+    hist = []
+    if prev:
+        prev_epoch = prev.get("epoch", now_e)
+        prev_ts = str(prev.get("ts", ""))
+        prev_lay = prev.get("lay")
+        hist = prev.get("hist", [])
+
+    age = int((now_e - prev_epoch) / 60)
+    if age < 0:
+        age = 0
+    to_off = int((info["race_epoch"] - now_e) / 60)
+
+    is_catchup = age > STALE_MINUTES
+    if is_catchup:
+        STATS["catchup"] += 1
+        header = "*NON-RUNNER (CATCH-UP)*"
+        stale_line = "STALE: price is " + str(age) + " min old, market has likely repriced\n"
+    else:
+        header = "*NON-RUNNER DETECTED*"
+        stale_line = ""
+
     if official is not None:
         STATS["official_rf"] += 1
         rf_line = "Reduction Factor: `" + pct(official) + "` (official)\n"
@@ -708,10 +759,8 @@ def fire_alert(info, key, name, status, price, side, prev, official,
 
     warn_line = ""
     if unverified:
-        warn_line = "RF unavailable - sub-" + str(MIN_ODDS) \
-            + " price unverified\n"
+        warn_line = "RF unavailable - sub-" + str(MIN_ODDS) + " price unverified\n"
 
-    hist = prev.get("hist", []) if prev else []
     trend = ""
     if len(hist) >= 2:
         moves = []
@@ -719,25 +768,16 @@ def fire_alert(info, key, name, status, price, side, prev, official,
             moves.append(str(h.get("p")))
         trend = "Move: `" + " -> ".join(moves) + "`\n"
 
-    prev_epoch = time.time()
-    prev_ts = ""
-    if prev:
-        prev_epoch = prev.get("epoch", prev_epoch)
-        prev_ts = str(prev.get("ts", ""))
-    age = int((time.time() - prev_epoch) / 60)
-    to_off = int((info["race_epoch"] - time.time()) / 60)
-
     lay_line = ""
-    if prev and prev.get("lay") and side == "back":
-        lay_line = "Lay: `" + fmt(prev.get("lay")) + "`\n"
+    if prev_lay and side == "back":
+        lay_line = "Lay: `" + fmt(prev_lay) + "`\n"
 
     ctry = ""
     if info.get("country"):
         ctry = " [" + info["country"] + "]"
 
-    if side == "back":
-        side_label = "Back Price"
-    else:
+    side_label = "Back Price"
+    if side != "back":
         side_label = "Lay Price (no back seen)"
 
     runners_line = ""
@@ -746,10 +786,9 @@ def fire_alert(info, key, name, status, price, side, prev, official,
 
     matched_line = ""
     if mkt_matched:
-        matched_line = "Market matched: " + "{:,.0f}".format(mkt_matched) \
-            + "\n"
+        matched_line = "Market matched: " + "{:,.0f}".format(mkt_matched) + "\n"
 
-    msg = "*NON-RUNNER DETECTED*\n\n"
+    msg = header + "\n\n"
     msg += "Horse: " + name + "\n"
     msg += "Race: " + info["race_label"] + ctry + "\n"
     msg += "Market: " + info["market_name"] + "\n"
@@ -759,67 +798,76 @@ def fire_alert(info, key, name, status, price, side, prev, official,
     msg += trend
     msg += rf_line
     msg += warn_line
+    msg += stale_line
     msg += runners_line
     msg += matched_line
     msg += "Off in: ~" + str(to_off) + " min\n"
-    msg += "Price from: `" + prev_ts + " UTC` (" + str(age) + "m before)\n"
+    msg += "Price from: `" + prev_ts + " UTC` (" + str(age) + "m ago)\n"
     msg += "Race Time: " + info["race_time"]
 
+    rf_note = "derived"
     if official is not None:
         rf_note = "official " + pct(official)
-    else:
-        rf_note = "derived"
-    log("ALERT: " + name + " @ " + info["race_label"]
-        + " [ACTIVE -> " + status + "] " + side + "=" + fmt(price)
-        + " rf=" + rf_note
-        + " runners=" + str(remaining)
-        + " off_in=" + str(to_off) + "m")
+
+    logline = "ALERT: " + name + " @ " + info["race_label"]
+    logline += " [ACTIVE -> " + status + "] " + side + "=" + fmt(price)
+    logline += " rf=" + rf_note
+    logline += " runners=" + str(remaining)
+    logline += " age=" + str(age) + "m"
+    logline += " off_in=" + str(to_off) + "m"
+    if is_catchup:
+        logline += " CATCHUP"
+    log(logline)
 
     if send_telegram(msg):
-        alerted[key] = time.time()
+        alerted[key] = now_e
         save_state()
         return 1
     return 0
 
 
-def evaluate_transition(info, key, name, status, back, prev,
-                        remaining, mkt_matched):
-    # ---- lead-time gate: cheapest check, runs first ----
+def evaluate_transition(info, key, name, status, back, prev, remaining, mkt_matched):
+    now_e = time.time()
+
+    # lead-time gate first, so a suppressed alert costs no RF lookup
     country = str(info.get("country", "")).upper()
     limit = LEAD_LIMITS.get(country)
     if limit is not None:
-        to_off = info["race_epoch"] - time.time()
+        to_off = info["race_epoch"] - now_e
         if to_off > limit:
-            alerted[key] = time.time()
+            alerted[key] = now_e
             STATS["filtered_lead_time"] += 1
-            log("FILTERED: " + name + " @ " + info["race_label"]
-                + " - " + country + " race starts in "
-                + "{:.1f}".format(to_off / 3600.0) + "h, limit "
-                + "{:.1f}".format(limit / 3600.0) + "h")
+            msg = "FILTERED: " + name + " @ " + info["race_label"]
+            msg += " - " + country + " race starts in "
+            msg += "{:.1f}".format(to_off / 3600.0) + "h, limit "
+            msg += "{:.1f}".format(limit / 3600.0) + "h"
+            log(msg)
             return 0
 
     price = back
     side = "back"
-    if not price and prev:
-        price = prev.get("back")
-    if not price and LAY_FALLBACK and prev:
-        price = prev.get("lay")
-        side = "lay"
+    if not price:
+        if prev:
+            price = prev.get("back")
+    if not price and LAY_FALLBACK:
+        if prev:
+            price = prev.get("lay")
+            side = "lay"
 
     if not price:
-        alerted[key] = time.time()
+        alerted[key] = now_e
         STATS["filtered_no_price"] += 1
-        log("FILTERED: " + name + " @ " + info["race_label"]
-            + " - no back price ever stored")
+        log("FILTERED: " + name + " @ " + info["race_label"] + " - no back price ever stored")
         return 0
 
     price = float(price)
 
     if price >= MAX_ODDS:
-        alerted[key] = time.time()
+        alerted[key] = now_e
         STATS["filtered_odds"] += 1
-        log("FILTERED: " + name + " @ " + info["race_label"]
-            + " - " + side + " " + fmt(price) + " not < " + str(MAX_ODDS))
+        msg = "FILTERED: " + name + " @ " + info["race_label"]
+        msg += " - " + side + " " + fmt(price) + " not < " + str(MAX_ODDS)
+        log(msg)
         return 0
 
     parts = key.split(":", 1)
@@ -828,36 +876,32 @@ def evaluate_transition(info, key, name, status, back, prev,
     official = fetch_official_rf(mid, sid)
     unverified = False
 
-    # ---- sub-MIN_ODDS placeholder guard ----
+    # placeholder-price guard below MIN_ODDS
     if price < MIN_ODDS:
         if official is not None and official >= GENUINE_FAV_RF:
             STATS["min_odds_override"] += 1
-            log("MIN_ODDS OVERRIDE: " + name + " @ " + info["race_label"]
-                + " - " + fmt(price) + " with official RF " + pct(official)
-                + " = genuine odds-on favourite")
+            msg = "MIN_ODDS OVERRIDE: " + name + " @ " + info["race_label"]
+            msg += " - " + fmt(price) + " with official RF " + pct(official)
+            log(msg)
         elif official is None:
             STATS["rf_unknown"] += 1
             if not MIN_ODDS_ALERT_ON_UNKNOWN_RF:
-                alerted[key] = time.time()
+                alerted[key] = now_e
                 STATS["filtered_min_odds"] += 1
-                log("FILTERED: " + name + " @ " + info["race_label"]
-                    + " - " + fmt(price) + " below " + str(MIN_ODDS)
-                    + " and RF unavailable")
+                log("FILTERED: " + name + " - below MIN_ODDS and RF unavailable")
                 return 0
             unverified = True
-            log("RF UNAVAILABLE: " + name + " @ " + info["race_label"]
-                + " - " + fmt(price) + " below " + str(MIN_ODDS)
-                + ", alerting anyway")
+            log("RF UNAVAILABLE: " + name + " - alerting anyway (unverified)")
         else:
-            alerted[key] = time.time()
+            alerted[key] = now_e
             STATS["filtered_min_odds"] += 1
-            log("FILTERED: " + name + " @ " + info["race_label"]
-                + " - " + fmt(price) + " below " + str(MIN_ODDS)
-                + " and official RF " + pct(official)
-                + " - placeholder price")
+            msg = "FILTERED: " + name + " @ " + info["race_label"]
+            msg += " - " + fmt(price) + " below " + str(MIN_ODDS)
+            msg += " and official RF " + pct(official) + " - placeholder price"
+            log(msg)
             return 0
 
-    # ---- RF / field-size gate ----
+    # RF / field-size gate
     if official is not None:
         rf_gate = official
         rf_src = "official"
@@ -866,25 +910,25 @@ def evaluate_transition(info, key, name, status, back, prev,
         rf_src = "derived"
 
     if rf_gate < RF_FLOOR:
-        alerted[key] = time.time()
+        alerted[key] = now_e
         STATS["filtered_rf_floor"] += 1
-        log("FILTERED: " + name + " @ " + info["race_label"]
-            + " - RF " + pct(rf_gate) + " (" + rf_src
-            + ") below floor " + str(RF_FLOOR) + "%")
+        msg = "FILTERED: " + name + " @ " + info["race_label"]
+        msg += " - RF " + pct(rf_gate) + " (" + rf_src + ") below floor " + str(RF_FLOOR) + "%"
+        log(msg)
         return 0
 
     if rf_gate < RF_ALWAYS:
         if remaining is not None and remaining > RF_MID_MAX_RUNNERS:
-            alerted[key] = time.time()
+            alerted[key] = now_e
             STATS["filtered_rf_field"] += 1
-            log("FILTERED: " + name + " @ " + info["race_label"]
-                + " - RF " + pct(rf_gate) + " (" + rf_src + ") in mid band"
-                + " but " + str(remaining) + " runners left, max "
-                + str(RF_MID_MAX_RUNNERS))
+            msg = "FILTERED: " + name + " @ " + info["race_label"]
+            msg += " - RF " + pct(rf_gate) + " (" + rf_src + ") mid band but "
+            msg += str(remaining) + " runners left, max " + str(RF_MID_MAX_RUNNERS)
+            log(msg)
             return 0
 
-    return fire_alert(info, key, name, status, price, side, prev,
-                      official, remaining, mkt_matched, unverified)
+    return fire_alert(info, key, name, status, price, side, prev, official,
+                      remaining, mkt_matched, unverified)
 
 
 # ---------------- process one market ----------------
@@ -894,11 +938,10 @@ def process_market(mid, info, odds_raw):
         n = market_fail[mid]
         if n == FAIL_ALERT_AFTER and mid not in fail_warned:
             fail_warned.add(mid)
-            log("MARKET FAILING: " + info["race_label"] + " " + mid
-                + " - " + str(n) + " consecutive fetch failures")
-            send_telegram("*Market not responding*\n" + info["race_label"]
-                          + "\n`" + mid + "` - " + str(n)
-                          + " consecutive failures, currently unwatched.")
+            log("MARKET FAILING: " + info["race_label"] + " " + mid + " - " + str(n) + " failures")
+            msg = "*Market not responding*\n" + info["race_label"]
+            msg += "\n`" + mid + "` - " + str(n) + " consecutive failures, currently unwatched."
+            send_telegram(msg)
         return 0
     market_fail[mid] = 0
 
@@ -907,8 +950,7 @@ def process_market(mid, info, odds_raw):
 
     mkt_status = str(g(book, "status", default="") or "").upper()
     if mkt_status:
-        _mkt_statuses_seen[mkt_status] = _mkt_statuses_seen.get(
-            mkt_status, 0) + 1
+        _mkt_statuses_seen[mkt_status] = _mkt_statuses_seen.get(mkt_status, 0) + 1
     if mkt_status in DEAD_MARKET_STATUSES:
         registry.pop(mid, None)
         return 0
@@ -916,8 +958,7 @@ def process_market(mid, info, odds_raw):
     n_winners = as_int(g(book, "numberOfWinners"))
     if n_winners is not None and n_winners > 1:
         STATS["place_dropped"] += 1
-        log("PLACE MARKET DROPPED: " + info["race_label"] + " "
-            + info["market_name"] + " numberOfWinners=" + str(n_winners))
+        log("PLACE MARKET DROPPED: " + info["race_label"] + " " + info["market_name"])
         registry.pop(mid, None)
         return 0
 
@@ -928,8 +969,7 @@ def process_market(mid, info, odds_raw):
     n_total = as_int(g(book, "numberOfRunners"))
     n_active = as_int(g(book, "numberOfActiveRunners"))
     try:
-        mkt_matched = float(g(book, "totalMatched", "total_matched",
-                              default=0) or 0)
+        mkt_matched = float(g(book, "totalMatched", "total_matched", default=0) or 0)
     except (TypeError, ValueError):
         mkt_matched = 0.0
 
@@ -949,8 +989,7 @@ def process_market(mid, info, odds_raw):
 
         name = info["runners"].get(sid)
         if not name:
-            name = str(g(r, "runnerName", "name",
-                         default="Selection " + sid))
+            name = str(g(r, "runnerName", "name", default="Selection " + sid))
 
         status = str(g(r, "status", default="") or "").upper().strip()
         if status:
@@ -967,44 +1006,45 @@ def process_market(mid, info, odds_raw):
             if prev:
                 hist = prev.get("hist", [])
             if back:
-                hist = hist + [{"t": now_utc.strftime("%H:%M"),
-                                "p": round(back, 2)}]
+                hist = hist + [{"t": now_utc.strftime("%H:%M"), "p": round(back, 2)}]
             keep_back = back
             if not keep_back and prev:
                 keep_back = prev.get("back")
             keep_lay = lay
             if not keep_lay and prev:
                 keep_lay = prev.get("lay")
-            runner_state[key] = {
-                "status": status,
-                "back": keep_back,
-                "lay": keep_lay,
-                "ts": now_utc.strftime("%d-%b %H:%M:%S"),
-                "epoch": now_e,
-                "hist": hist[-5:],
-            }
+            fresh = {}
+            fresh["status"] = status
+            fresh["back"] = keep_back
+            fresh["lay"] = keep_lay
+            fresh["ts"] = now_utc.strftime("%d-%b %H:%M:%S")
+            fresh["epoch"] = now_e
+            fresh["hist"] = hist[-5:]
+            runner_state[key] = fresh
             continue
 
         if prev is None:
-            runner_state[key] = {
-                "status": status,
-                "back": back,
-                "lay": lay,
-                "ts": now_utc.strftime("%d-%b %H:%M:%S"),
-                "epoch": now_e,
-                "hist": [],
-            }
+            fresh = {}
+            fresh["status"] = status
+            fresh["back"] = back
+            fresh["lay"] = lay
+            fresh["ts"] = now_utc.strftime("%d-%b %H:%M:%S")
+            fresh["epoch"] = now_e
+            fresh["hist"] = []
+            runner_state[key] = fresh
             continue
 
         was = prev.get("status")
+        # snapshot BEFORE mutating, or the age shown in the alert is always 0
+        prev_snapshot = dict(prev)
         runner_state[key]["status"] = status
         runner_state[key]["epoch"] = now_e
         if was != "ACTIVE":
             continue
         if key in alerted:
             continue
-        alerts += evaluate_transition(info, key, name, status, back, prev,
-                                      n_active, mkt_matched)
+        alerts += evaluate_transition(info, key, name, status, back,
+                                      prev_snapshot, n_active, mkt_matched)
 
     listed = len(listed_ids)
 
@@ -1012,16 +1052,18 @@ def process_market(mid, info, odds_raw):
         if mid not in recon_warned:
             recon_warned.add(mid)
             STATS["recon_mismatch"] += 1
-            log("RECON MISMATCH: " + info["race_label"] + " " + mid
-                + " - payload lists " + str(listed)
-                + " runners but numberOfRunners=" + str(n_total))
+            msg = "RECON MISMATCH: " + info["race_label"] + " " + mid
+            msg += " - payload lists " + str(listed) + " but numberOfRunners=" + str(n_total)
+            log(msg)
+
     if n_active is not None and listed_active != n_active:
         if mid not in recon_warned:
             recon_warned.add(mid)
             STATS["recon_mismatch"] += 1
-            log("RECON MISMATCH: " + info["race_label"] + " " + mid
-                + " - " + str(listed_active) + " ACTIVE listed but "
-                + "numberOfActiveRunners=" + str(n_active))
+            msg = "RECON MISMATCH: " + info["race_label"] + " " + mid
+            msg += " - " + str(listed_active) + " ACTIVE listed but numberOfActiveRunners="
+            msg += str(n_active)
+            log(msg)
 
     if n_total is not None and listed == n_total:
         for sid in info["runners"]:
@@ -1037,12 +1079,13 @@ def process_market(mid, info, odds_raw):
                 continue
             name = info["runners"][sid]
             STATS["vanished"] += 1
-            log("VANISHED: " + name + " @ " + info["race_label"]
-                + " - was ACTIVE, no longer listed")
+            log("VANISHED: " + name + " @ " + info["race_label"] + " - no longer listed")
+            prev_snapshot = dict(prev)
             runner_state[key]["status"] = "VANISHED"
             runner_state[key]["epoch"] = now_e
-            alerts += evaluate_transition(info, key, name, "VANISHED",
-                                          None, prev, n_active, mkt_matched)
+            alerts += evaluate_transition(info, key, name, "VANISHED", None,
+                                          prev_snapshot, n_active, mkt_matched)
+
     return alerts
 
 
@@ -1093,28 +1136,30 @@ def poll_cycle():
         if n >= FAIL_ALERT_AFTER:
             failing += 1
 
-    log("CYCLE: polled=" + str(len(due))
-        + " registry=" + str(len(registry))
-        + " tracked=" + str(len(runner_state))
-        + " alerts=" + str(alerts)
-        + " failing=" + str(failing)
-        + " lead_time=" + str(STATS["filtered_lead_time"])
-        + " rf_floor=" + str(STATS["filtered_rf_floor"])
-        + " rf_field=" + str(STATS["filtered_rf_field"])
-        + " no_price=" + str(STATS["filtered_no_price"])
-        + " min_odds=" + str(STATS["filtered_min_odds"])
-        + " max_odds=" + str(STATS["filtered_odds"])
-        + " fav_override=" + str(STATS["min_odds_override"])
-        + " rf_unknown=" + str(STATS["rf_unknown"])
-        + " place_dropped=" + str(STATS["place_dropped"])
-        + " recon=" + str(STATS["recon_mismatch"])
-        + " vanished=" + str(STATS["vanished"])
-        + " rf_official=" + str(STATS["official_rf"])
-        + " rf_derived=" + str(STATS["derived_rf"])
-        + " statuses=" + str(dict(sorted(_statuses_seen.items())))
-        + " mkt_statuses=" + str(dict(sorted(_mkt_statuses_seen.items())))
-        + " api_calls=" + str(STATS["calls"])
-        + " api_errors=" + str(STATS["errors"]))
+    line = "CYCLE: polled=" + str(len(due))
+    line += " registry=" + str(len(registry))
+    line += " tracked=" + str(len(runner_state))
+    line += " alerts=" + str(alerts)
+    line += " catchup=" + str(STATS["catchup"])
+    line += " failing=" + str(failing)
+    line += " lead_time=" + str(STATS["filtered_lead_time"])
+    line += " rf_floor=" + str(STATS["filtered_rf_floor"])
+    line += " rf_field=" + str(STATS["filtered_rf_field"])
+    line += " no_price=" + str(STATS["filtered_no_price"])
+    line += " min_odds=" + str(STATS["filtered_min_odds"])
+    line += " max_odds=" + str(STATS["filtered_odds"])
+    line += " fav_override=" + str(STATS["min_odds_override"])
+    line += " rf_unknown=" + str(STATS["rf_unknown"])
+    line += " place_dropped=" + str(STATS["place_dropped"])
+    line += " recon=" + str(STATS["recon_mismatch"])
+    line += " vanished=" + str(STATS["vanished"])
+    line += " rf_official=" + str(STATS["official_rf"])
+    line += " rf_derived=" + str(STATS["derived_rf"])
+    line += " statuses=" + str(dict(sorted(_statuses_seen.items())))
+    line += " mkt_statuses=" + str(dict(sorted(_mkt_statuses_seen.items())))
+    line += " api_calls=" + str(STATS["calls"])
+    line += " api_errors=" + str(STATS["errors"])
+    log(line)
 
 
 def startup_banner():
@@ -1124,17 +1169,14 @@ def startup_banner():
         log("Auth header: sent")
     else:
         log("Auth header: NOT sent (no key)")
-
     if ALLOWED_REGIONS:
         log("Regions: " + str(sorted(ALLOWED_REGIONS)))
     else:
         log("Regions: ALL")
-
     if MAX_DAYS_AHEAD > 0:
         log("Days ahead: " + str(MAX_DAYS_AHEAD))
     else:
         log("Days ahead: unlimited")
-
     if LEAD_LIMITS:
         parts = []
         for k in sorted(LEAD_LIMITS):
@@ -1143,46 +1185,34 @@ def startup_banner():
         log("Lead-time limits: " + ", ".join(parts))
     else:
         log("Lead-time limits: none")
-
     log("Trigger: runner ACTIVE -> ANY other status, or vanished")
     log("RF gate: >=" + str(RF_ALWAYS) + "% any field size")
-    log("RF gate: " + str(RF_FLOOR) + "-" + str(RF_ALWAYS)
-        + "% only if <= " + str(RF_MID_MAX_RUNNERS) + " runners left")
+    log("RF gate: " + str(RF_FLOOR) + "-" + str(RF_ALWAYS) + "% only if <= " + str(RF_MID_MAX_RUNNERS) + " runners left")
     log("RF gate: <" + str(RF_FLOOR) + "% never alerts")
-    log("Odds window: " + str(MIN_ODDS) + " <= back price < "
-        + str(MAX_ODDS))
-    if MIN_ODDS_ALERT_ON_UNKNOWN_RF:
-        unk = "alert (flagged unverified)"
-    else:
-        unk = "suppress"
-    log("Below " + str(MIN_ODDS) + ": alert only if official RF >= "
-        + str(GENUINE_FAV_RF) + "%; if RF unknown -> " + unk)
+    log("Odds window: " + str(MIN_ODDS) + " <= back price < " + str(MAX_ODDS))
+    log("Stale threshold: alerts older than " + str(STALE_MINUTES) + " min are marked CATCH-UP")
     log("RF lookup attempts: " + str(RF_ATTEMPTS))
-    log("Polling: " + str(POLL_SECONDS) + "s per market, "
-        + str(WORKERS) + " workers, tick " + str(TICK) + "s")
+    log("Polling: " + str(POLL_SECONDS) + "s per market, " + str(WORKERS) + " workers, tick " + str(TICK) + "s")
     log("State file: " + STATE_FILE)
 
 
 def startup_telegram(had_state):
+    state_note = "(cold start)"
     if had_state:
         state_note = "(state restored)"
-    else:
-        state_note = "(cold start)"
-    lead_note = ""
-    if LEAD_LIMITS:
-        lead_note = "\nLead limit: " + LEAD_LIMITS_RAW
-    msg = "Non-runner monitor LIVE " + state_note
-    msg += "\nHost: DigitalOcean 139.59.20.81"
-    msg += "\n" + str(len(registry)) + " races registered, "
-    msg += str(len(runner_state)) + " runners tracked."
-    msg += "\nRF gate: >=" + str(RF_ALWAYS) + "% any | "
+    msg = "Non-runner monitor LIVE " + state_note + "\n"
+    msg += "Host: DigitalOcean 139.59.20.81\n"
+    msg += str(len(registry)) + " races registered, "
+    msg += str(len(runner_state)) + " runners tracked.\n"
+    msg += "RF gate: >=" + str(RF_ALWAYS) + "% any | "
     msg += str(RF_FLOOR) + "-" + str(RF_ALWAYS) + "% if <= "
     msg += str(RF_MID_MAX_RUNNERS) + " runners"
-    msg += lead_note
+    if LEAD_LIMITS:
+        msg += "\nLead limit: " + LEAD_LIMITS_RAW
     send_telegram(msg)
 
 
-if __name__ == "__main__":
+def main():
     startup_banner()
     load_state()
     choose_base()
@@ -1234,3 +1264,7 @@ if __name__ == "__main__":
         except Exception as e:
             err("Loop error: " + str(e), e)
         time.sleep(TICK)
+
+
+if __name__ == "__main__":
+    main()
