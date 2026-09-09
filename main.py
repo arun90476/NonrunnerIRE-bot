@@ -22,6 +22,8 @@ API_KEY = os.environ.get("API_KEY", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8949652801:AAFPYHnRXHERi4P28UFJKhqPaVd9RnuVeqI")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "8435489741")
 
+HOST_LABEL = os.environ.get("HOST_LABEL", "168.144.94.64")
+
 SPORT_ID = 7
 
 REGIONS = os.environ.get("REGIONS", "ALL")
@@ -32,22 +34,16 @@ if REGIONS.strip().upper() != "ALL":
         if _r:
             ALLOWED_REGIONS.add(_r)
 
-# PRIMARY GATE - official Betfair reduction factor decides on its own.
-#   RF >= RF_ALWAYS            -> alert, any field size, any displayed price
-#   RF_FLOOR <= RF < RF_ALWAYS -> alert only if remaining <= RF_MID_MAX_RUNNERS
-#   RF <  RF_FLOOR             -> never alert
+# ---- STRATEGY 1: NON-RUNNER. Official RF decides alone. ----
 RF_ALWAYS = float(os.environ.get("RF_ALWAYS", "20.0"))
 RF_FLOOR = float(os.environ.get("RF_FLOOR", "16.0"))
 RF_MID_MAX_RUNNERS = int(os.environ.get("RF_MID_MAX_RUNNERS", "8"))
 
-# FALLBACK ONLY - used when the official RF lookup fails.
+# fallback only, used when the official RF lookup fails
 MAX_ODDS = float(os.environ.get("MAX_ODDS", "6.0"))
 MIN_ODDS = float(os.environ.get("MIN_ODDS", "1.20"))
 MIN_ODDS_ALERT_ON_UNKNOWN_RF = os.environ.get("MIN_ODDS_ALERT_ON_UNKNOWN_RF", "1") == "1"
-
-# flag when the displayed price and the official RF disagree badly
 PRICE_MISMATCH_RATIO = float(os.environ.get("PRICE_MISMATCH_RATIO", "1.5"))
-
 RF_ATTEMPTS = int(os.environ.get("RF_ATTEMPTS", "2"))
 STALE_MINUTES = float(os.environ.get("STALE_MINUTES", "15"))
 
@@ -64,6 +60,24 @@ for _part in LEAD_LIMITS_RAW.split(","):
         LEAD_LIMITS[_c.strip().upper()] = float(_h.strip()) * 3600.0
     except ValueError:
         pass
+
+# ---- STRATEGY 2: PRICE STEAM (late market drift-in) ----
+# Small UK/IRE fields only. Watch the last part of the market and alert
+# when a short-priced runner shortens by an absolute amount.
+STEAM_ENABLED = os.environ.get("STEAM_ENABLED", "1") == "1"
+STEAM_REGIONS = set()
+for _r in os.environ.get("STEAM_REGIONS", "GB,IE").split(","):
+    _r = _r.strip().upper()
+    if _r:
+        STEAM_REGIONS.add(_r)
+STEAM_MAX_RUNNERS = int(os.environ.get("STEAM_MAX_RUNNERS", "5"))
+STEAM_WINDOW_START = float(os.environ.get("STEAM_WINDOW_START_MIN", "30")) * 60.0
+STEAM_WINDOW_END = float(os.environ.get("STEAM_WINDOW_END_MIN", "5")) * 60.0
+STEAM_MAX_PRICE = float(os.environ.get("STEAM_MAX_PRICE", "2.50"))
+STEAM_DROP = float(os.environ.get("STEAM_DROP", "0.20"))
+# "high" = measure the drop from the highest price seen inside the window
+# "entry" = measure it from the price when the window opened
+STEAM_BASELINE = os.environ.get("STEAM_BASELINE", "high").strip().lower()
 
 LAY_FALLBACK = os.environ.get("LAY_FALLBACK", "0") == "1"
 OFFICIAL_RF = os.environ.get("OFFICIAL_RF", "1") == "1"
@@ -83,9 +97,11 @@ STATE_FILE = os.environ.get("STATE_FILE", "/opt/nrbot/nr_state.json")
 STATE_SAVE_EVERY = 20
 RUNNER_STATE_TTL = 4 * 86400
 SEEN_TTL_SECONDS = 4 * 86400
+STEAM_STATE_TTL = 6 * 3600
 FAIL_ALERT_AFTER = int(os.environ.get("FAIL_ALERT_AFTER", "6"))
 
 UK_TZ = ZoneInfo("Europe/London")
+IST_TZ = ZoneInfo("Asia/Kolkata")
 
 BAD_EVENT_MARKERS = ("(rfc)", "(f/c)", "(fc)", "(tri)", "(tricast)",
                      "antepost", "ante-post", "ante post")
@@ -103,6 +119,8 @@ DEAD_MARKET_STATUSES = ("CLOSED", "SETTLED", "VOIDED", "CANCELLED")
 registry = {}
 runner_state = {}
 alerted = {}
+steam_state = {}
+steam_alerted = {}
 event_fetched = {}
 market_fail = {}
 fail_warned = set()
@@ -132,6 +150,7 @@ STATS = {
     "derived_rf": 0,
     "price_mismatch": 0,
     "catchup": 0,
+    "steam_alerts": 0,
 }
 
 
@@ -144,6 +163,18 @@ def err(msg, exc=None):
     log("[ERR] " + msg)
     if exc is not None:
         print(traceback.format_exc(), flush=True)
+
+
+def ist_now():
+    return datetime.datetime.now(IST_TZ).strftime("%d-%b %H:%M:%S")
+
+
+def ist_from_epoch(epoch):
+    try:
+        dt = datetime.datetime.fromtimestamp(float(epoch), IST_TZ)
+        return dt.strftime("%d-%b %H:%M")
+    except (TypeError, ValueError, OSError):
+        return "unknown"
 
 
 # ---------------- telegram ----------------
@@ -444,6 +475,7 @@ def load_state():
         d = json.load(f)
         f.close()
         now = time.time()
+
         saved = d.get("alerted") or {}
         for k in saved:
             try:
@@ -452,6 +484,7 @@ def load_state():
                 continue
             if now - v < SEEN_TTL_SECONDS:
                 alerted[str(k)] = v
+
         kept = 0
         rs = d.get("runner_state") or {}
         for k in rs:
@@ -465,16 +498,44 @@ def load_state():
             if now - epoch < RUNNER_STATE_TTL:
                 runner_state[str(k)] = v
                 kept += 1
-        log("State restored: " + str(len(alerted)) + " alerted, " + str(kept) + " runner statuses")
+
+        sa = d.get("steam_alerted") or {}
+        for k in sa:
+            try:
+                v = float(sa[k])
+            except (TypeError, ValueError):
+                continue
+            if now - v < SEEN_TTL_SECONDS:
+                steam_alerted[str(k)] = v
+
+        ss = d.get("steam_state") or {}
+        for k in ss:
+            v = ss[k]
+            if not isinstance(v, dict):
+                continue
+            try:
+                epoch = float(v.get("epoch", 0))
+            except (TypeError, ValueError):
+                continue
+            if now - epoch < STEAM_STATE_TTL:
+                steam_state[str(k)] = v
+
+        log("State restored: " + str(len(alerted)) + " alerted, " + str(kept)
+            + " runner statuses, " + str(len(steam_state)) + " steam windows")
     except Exception as e:
         err("State load failed: " + str(e), e)
 
 
 def save_state():
     try:
+        payload = {}
+        payload["alerted"] = alerted
+        payload["runner_state"] = runner_state
+        payload["steam_alerted"] = steam_alerted
+        payload["steam_state"] = steam_state
         tmp = STATE_FILE + ".tmp"
         f = open(tmp, "w")
-        json.dump({"alerted": alerted, "runner_state": runner_state}, f)
+        json.dump(payload, f)
         f.close()
         os.replace(tmp, STATE_FILE)
     except Exception as e:
@@ -483,6 +544,7 @@ def save_state():
 
 def prune_state():
     now = time.time()
+
     stale = []
     for k in runner_state:
         try:
@@ -493,12 +555,31 @@ def prune_state():
             stale.append(k)
     for k in stale:
         runner_state.pop(k, None)
+
     old = []
     for k in alerted:
         if now - float(alerted[k]) > SEEN_TTL_SECONDS:
             old.append(k)
     for k in old:
         alerted.pop(k, None)
+
+    dead = []
+    for k in steam_state:
+        try:
+            epoch = float(steam_state[k].get("epoch", now))
+        except (TypeError, ValueError):
+            epoch = now
+        if now - epoch > STEAM_STATE_TTL:
+            dead.append(k)
+    for k in dead:
+        steam_state.pop(k, None)
+
+    gone = []
+    for k in steam_alerted:
+        if now - float(steam_alerted[k]) > SEEN_TTL_SECONDS:
+            gone.append(k)
+    for k in gone:
+        steam_alerted.pop(k, None)
 
 
 # ---------------- discovery ----------------
@@ -723,7 +804,118 @@ def discover():
             log("NON-WIN MARKET NAMES EXCLUDED: " + str(sorted(_skipped_names)[:30]))
 
 
-# ---------------- alerting ----------------
+# ---------------- STRATEGY 2: price steam ----------------
+def check_steam(info, key, name, back, n_active, mkt_matched):
+    """Small UK/IRE fields only. Inside the window, alert when a runner
+    priced at or under STEAM_MAX_PRICE shortens by STEAM_DROP or more.
+    Uses only data already fetched - no extra API calls."""
+    if not STEAM_ENABLED:
+        return 0
+    if back is None:
+        return 0
+    if key in steam_alerted:
+        return 0
+
+    country = str(info.get("country", "")).upper()
+    if STEAM_REGIONS:
+        if country not in STEAM_REGIONS:
+            return 0
+
+    if n_active is None:
+        return 0
+    if n_active > STEAM_MAX_RUNNERS:
+        return 0
+
+    now_e = time.time()
+    to_off = info["race_epoch"] - now_e
+    if to_off > STEAM_WINDOW_START:
+        return 0
+    if to_off < STEAM_WINDOW_END:
+        return 0
+
+    back = float(back)
+    st = steam_state.get(key)
+
+    if st is None:
+        st = {}
+        st["entry"] = back
+        st["high"] = back
+        st["low"] = back
+        st["entered"] = now_e
+        st["epoch"] = now_e
+        st["n"] = 1
+        steam_state[key] = st
+        return 0
+
+    st["epoch"] = now_e
+    st["n"] = st.get("n", 1) + 1
+    if back > st.get("high", back):
+        st["high"] = back
+    if back < st.get("low", back):
+        st["low"] = back
+
+    if STEAM_BASELINE == "entry":
+        baseline = st.get("entry", back)
+        baseline_label = "window entry"
+    else:
+        baseline = st.get("high", back)
+        baseline_label = "window high"
+
+    baseline = float(baseline)
+    if baseline > STEAM_MAX_PRICE:
+        return 0
+
+    drop = baseline - back
+    if drop < STEAM_DROP:
+        return 0
+
+    steam_alerted[key] = now_e
+    STATS["steam_alerts"] += 1
+
+    drop_pct = 0.0
+    if baseline > 0:
+        drop_pct = (drop / baseline) * 100.0
+
+    mins_to_off = int(to_off / 60)
+    watched = int((now_e - st.get("entered", now_e)) / 60)
+
+    ctry = ""
+    if country:
+        ctry = " [" + country + "]"
+
+    matched_line = ""
+    if mkt_matched:
+        matched_line = "Market matched: " + "{:,.0f}".format(mkt_matched) + "\n"
+
+    msg = "*PRICE STEAM DETECTED*\n\n"
+    msg += "Horse: " + name + "\n"
+    msg += "Race: " + info["race_label"] + ctry + "\n"
+    msg += "Market: " + info["market_name"] + "\n"
+    msg += "Price: `" + fmt(baseline) + "` -> `" + fmt(back) + "`\n"
+    msg += "Drop: `" + fmt(drop) + "` (" + "{:.1f}".format(drop_pct) + "%)\n"
+    msg += "Baseline: " + baseline_label + ", low so far `" + fmt(st.get("low", back)) + "`\n"
+    msg += "Runners: " + str(n_active) + "\n"
+    msg += matched_line
+    msg += "Watched for: " + str(watched) + " min\n"
+    msg += "Off in: ~" + str(mins_to_off) + " min\n"
+    msg += "Alert time IST: " + ist_now() + "\n"
+    msg += "Race Time: " + info["race_time"] + "\n"
+    msg += "Race Time IST: " + ist_from_epoch(info["race_epoch"])
+
+    logline = "STEAM: " + name + " @ " + info["race_label"]
+    logline += " " + fmt(baseline) + " -> " + fmt(back)
+    logline += " drop=" + fmt(drop)
+    logline += " runners=" + str(n_active)
+    logline += " off_in=" + str(mins_to_off) + "m"
+    log(logline)
+
+    if send_telegram(msg):
+        save_state()
+        return 1
+    return 0
+
+
+# ---------------- STRATEGY 1: non-runner alert ----------------
 def fire_alert(info, key, name, status, price, side, prev, official, rf_used,
                remaining, mkt_matched, unverified, implied, mismatch):
     now_e = time.time()
@@ -814,7 +1006,9 @@ def fire_alert(info, key, name, status, price, side, prev, official, rf_used,
     msg += matched_line
     msg += "Off in: ~" + str(to_off) + " min\n"
     msg += "Price from: `" + prev_ts + " UTC` (" + str(age) + "m ago)\n"
-    msg += "Race Time: " + info["race_time"]
+    msg += "Alert time IST: " + ist_now() + "\n"
+    msg += "Race Time: " + info["race_time"] + "\n"
+    msg += "Race Time IST: " + ist_from_epoch(info["race_epoch"])
 
     rf_note = "derived " + pct(rf_used)
     if official is not None:
@@ -842,7 +1036,6 @@ def fire_alert(info, key, name, status, price, side, prev, official, rf_used,
 def evaluate_transition(info, key, name, status, back, prev, remaining, mkt_matched):
     now_e = time.time()
 
-    # ---- 1. lead-time gate, cheapest check, before any API call ----
     country = str(info.get("country", "")).upper()
     limit = LEAD_LIMITS.get(country)
     if limit is not None:
@@ -857,7 +1050,6 @@ def evaluate_transition(info, key, name, status, back, prev, remaining, mkt_matc
             log(msg)
             return 0
 
-    # ---- 2. observed price, may be missing ----
     price = back
     side = "back"
     if not price:
@@ -872,21 +1064,16 @@ def evaluate_transition(info, key, name, status, back, prev, remaining, mkt_matc
     else:
         price = None
 
-    # ---- 3. official RF ----
     parts = key.split(":", 1)
     mid = parts[0]
     sid = parts[1]
     official = fetch_official_rf(mid, sid)
-
     unverified = False
 
     if official is not None:
-        # OFFICIAL RF DECIDES. The displayed price is information only -
-        # a placeholder ladder can no longer veto a large reduction factor.
         rf_used = official
         rf_src = "official"
     else:
-        # FALLBACK: no official RF, so the price rules apply instead.
         unverified = True
         rf_src = "derived"
         if price is None:
@@ -912,7 +1099,6 @@ def evaluate_transition(info, key, name, status, back, prev, remaining, mkt_matc
             log("RF UNAVAILABLE: " + name + " - sub-MIN_ODDS, alerting unverified")
         rf_used = (1.0 / price) * 100.0
 
-    # ---- 4. RF gate, identical for both paths ----
     if rf_used < RF_FLOOR:
         alerted[key] = now_e
         STATS["filtered_rf_floor"] += 1
@@ -931,7 +1117,6 @@ def evaluate_transition(info, key, name, status, back, prev, remaining, mkt_matc
             log(msg)
             return 0
 
-    # ---- 5. price for display, plus mismatch detection ----
     implied = 0.0
     if rf_used > 0:
         implied = 100.0 / rf_used
@@ -993,6 +1178,11 @@ def process_market(mid, info, odds_raw):
     except (TypeError, ValueError):
         mkt_matched = 0.0
 
+    inplay = g(book, "inplay", default=False)
+    suspended = False
+    if mkt_status == "SUSPENDED":
+        suspended = True
+
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     now_e = time.time()
     alerts = 0
@@ -1041,6 +1231,10 @@ def process_market(mid, info, odds_raw):
             fresh["epoch"] = now_e
             fresh["hist"] = hist[-5:]
             runner_state[key] = fresh
+
+            # STRATEGY 2 runs only on live, non-suspended prices
+            if not suspended and not inplay:
+                alerts += check_steam(info, key, name, back, n_active, mkt_matched)
             continue
 
         if prev is None:
@@ -1055,7 +1249,6 @@ def process_market(mid, info, odds_raw):
             continue
 
         was = prev.get("status")
-        # snapshot BEFORE mutating, or the age shown in the alert is always 0
         prev_snapshot = dict(prev)
         runner_state[key]["status"] = status
         runner_state[key]["epoch"] = now_e
@@ -1160,6 +1353,8 @@ def poll_cycle():
     line += " registry=" + str(len(registry))
     line += " tracked=" + str(len(runner_state))
     line += " alerts=" + str(alerts)
+    line += " steam=" + str(STATS["steam_alerts"])
+    line += " steam_watch=" + str(len(steam_state))
     line += " catchup=" + str(STATS["catchup"])
     line += " mismatch=" + str(STATS["price_mismatch"])
     line += " failing=" + str(failing)
@@ -1182,7 +1377,8 @@ def poll_cycle():
 
 
 def startup_banner():
-    log("=== NON-RUNNER MONITOR - PRODUCTION (DigitalOcean) ===")
+    log("=== RACING MONITOR - PRODUCTION ===")
+    log("Host: " + HOST_LABEL)
     log("Base: " + API_BASE + "  alt " + API_BASE_ALT)
     if API_KEY:
         log("Auth header: sent")
@@ -1204,6 +1400,8 @@ def startup_banner():
         log("Lead-time limits: " + ", ".join(parts))
     else:
         log("Lead-time limits: none")
+
+    log("--- STRATEGY 1: NON-RUNNER ---")
     log("Trigger: runner ACTIVE -> ANY other status, or vanished")
     log("PRIMARY GATE - official RF decides alone:")
     log("  RF >= " + str(RF_ALWAYS) + "% -> alert, any field size, any price")
@@ -1211,7 +1409,17 @@ def startup_banner():
     log("  RF < " + str(RF_FLOOR) + "% -> never")
     log("FALLBACK when RF lookup fails: " + str(MIN_ODDS) + " <= price < " + str(MAX_ODDS))
     log("Stale threshold: alerts older than " + str(STALE_MINUTES) + " min marked CATCH-UP")
-    log("RF lookup attempts: " + str(RF_ATTEMPTS))
+
+    log("--- STRATEGY 2: PRICE STEAM ---")
+    if STEAM_ENABLED:
+        log("Regions: " + str(sorted(STEAM_REGIONS)))
+        log("Field size: " + str(STEAM_MAX_RUNNERS) + " active runners or fewer")
+        log("Window: from " + str(int(STEAM_WINDOW_START / 60)) + " min to " + str(int(STEAM_WINDOW_END / 60)) + " min before the off")
+        log("Trigger: price " + str(STEAM_MAX_PRICE) + " or shorter drops by " + str(STEAM_DROP) + " or more")
+        log("Baseline: " + STEAM_BASELINE + "  (one alert per horse)")
+    else:
+        log("DISABLED")
+
     log("Polling: " + str(POLL_SECONDS) + "s per market, " + str(WORKERS) + " workers, tick " + str(TICK) + "s")
     log("State file: " + STATE_FILE)
 
@@ -1220,15 +1428,23 @@ def startup_telegram(had_state):
     state_note = "(cold start)"
     if had_state:
         state_note = "(state restored)"
-    msg = "Non-runner monitor LIVE " + state_note + "\n"
-    msg += "Host: DigitalOcean 139.59.20.81\n"
+    msg = "Racing monitor LIVE " + state_note + "\n"
+    msg += "Host: " + HOST_LABEL + "\n"
     msg += str(len(registry)) + " races registered, "
     msg += str(len(runner_state)) + " runners tracked.\n"
-    msg += "RF gate: >=" + str(RF_ALWAYS) + "% any | "
+    msg += "S1 non-runner RF gate: >=" + str(RF_ALWAYS) + "% any | "
     msg += str(RF_FLOOR) + "-" + str(RF_ALWAYS) + "% if <= "
-    msg += str(RF_MID_MAX_RUNNERS) + " runners"
+    msg += str(RF_MID_MAX_RUNNERS) + " runners\n"
+    if STEAM_ENABLED:
+        msg += "S2 steam: " + ",".join(sorted(STEAM_REGIONS))
+        msg += ", <=" + str(STEAM_MAX_RUNNERS) + " runners, "
+        msg += str(int(STEAM_WINDOW_START / 60)) + "-" + str(int(STEAM_WINDOW_END / 60))
+        msg += " min out, " + str(STEAM_MAX_PRICE) + " or shorter, drop "
+        msg += str(STEAM_DROP) + "+\n"
+    else:
+        msg += "S2 steam: disabled\n"
     if LEAD_LIMITS:
-        msg += "\nLead limit: " + LEAD_LIMITS_RAW
+        msg += "Lead limit: " + LEAD_LIMITS_RAW
     send_telegram(msg)
 
 
