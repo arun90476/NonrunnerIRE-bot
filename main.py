@@ -64,18 +64,20 @@ for _part in LEAD_LIMITS_RAW.split(","):
         pass
 
 # ---- STRATEGY 2: PRICE DRIFT (late market drift-out) ----
-# Small GB/IE fields only. Inside the window, alert when a runner that was
-# priced at or under DRIFT_MAX_PRICE lengthens by DRIFT_RISE or more.
+# GB/IE, any field size. Inside the window, alert when a runner whose
+# baseline price sits between DRIFT_MIN_PRICE and DRIFT_MAX_PRICE
+# lengthens by DRIFT_RISE or more.
 DRIFT_ENABLED = os.environ.get("DRIFT_ENABLED", "1") == "1"
 DRIFT_REGIONS = set()
 for _r in os.environ.get("DRIFT_REGIONS", "GB,IE").split(","):
     _r = _r.strip().upper()
     if _r:
         DRIFT_REGIONS.add(_r)
-DRIFT_MAX_RUNNERS = int(os.environ.get("DRIFT_MAX_RUNNERS", "5"))
-DRIFT_WINDOW_START = float(os.environ.get("DRIFT_WINDOW_START_MIN", "30")) * 60.0
+DRIFT_MAX_RUNNERS = int(os.environ.get("DRIFT_MAX_RUNNERS", "999"))
+DRIFT_WINDOW_START = float(os.environ.get("DRIFT_WINDOW_START_MIN", "60")) * 60.0
 DRIFT_WINDOW_END = float(os.environ.get("DRIFT_WINDOW_END_MIN", "5")) * 60.0
 DRIFT_MAX_PRICE = float(os.environ.get("DRIFT_MAX_PRICE", "2.20"))
+DRIFT_MIN_PRICE = float(os.environ.get("DRIFT_MIN_PRICE", "1.50"))
 DRIFT_RISE = float(os.environ.get("DRIFT_RISE", "0.20"))
 # "low" = measure the rise from the lowest price seen inside the window
 # "entry" = measure it from the price when the window opened
@@ -811,9 +813,10 @@ def discover():
 
 # ---------------- STRATEGY 2: price drift ----------------
 def check_drift(info, key, name, back, n_active, mkt_matched):
-    """Small GB/IE fields only. Inside the window, alert when a runner that
-    was priced at or under DRIFT_MAX_PRICE lengthens by DRIFT_RISE or more.
-    Uses only data already fetched - no extra API calls."""
+    """GB/IE, any field size by default. Inside the window, alert when a
+    runner whose baseline price sits between DRIFT_MIN_PRICE and
+    DRIFT_MAX_PRICE lengthens by DRIFT_RISE or more. Uses only data
+    already fetched - no extra API calls."""
     if not DRIFT_ENABLED:
         return 0
     if back is None:
@@ -868,6 +871,8 @@ def check_drift(info, key, name, back, n_active, mkt_matched):
 
     baseline = float(baseline)
     if baseline > DRIFT_MAX_PRICE:
+        return 0
+    if baseline < DRIFT_MIN_PRICE:
         return 0
 
     rise = back - baseline
@@ -1418,9 +1423,12 @@ def startup_banner():
     log("--- STRATEGY 2: PRICE DRIFT ---")
     if DRIFT_ENABLED:
         log("Regions: " + str(sorted(DRIFT_REGIONS)))
-        log("Field size: " + str(DRIFT_MAX_RUNNERS) + " active runners or fewer")
+        if DRIFT_MAX_RUNNERS >= 999:
+            log("Field size: any")
+        else:
+            log("Field size: " + str(DRIFT_MAX_RUNNERS) + " active runners or fewer")
         log("Window: from " + str(int(DRIFT_WINDOW_START / 60)) + " min to " + str(int(DRIFT_WINDOW_END / 60)) + " min before the off")
-        log("Trigger: price " + str(DRIFT_MAX_PRICE) + " or shorter LENGTHENS by " + str(DRIFT_RISE) + " or more")
+        log("Trigger: price " + str(DRIFT_MIN_PRICE) + " to " + str(DRIFT_MAX_PRICE) + " LENGTHENS by " + str(DRIFT_RISE) + " or more")
         log("Baseline: " + DRIFT_BASELINE + "  (one alert per horse)")
     else:
         log("DISABLED")
@@ -1444,10 +1452,13 @@ def startup_telegram(had_state):
     msg += str(RF_MID_MAX_RUNNERS) + " runners\n"
     if DRIFT_ENABLED:
         msg += "S2 drift: " + ",".join(sorted(DRIFT_REGIONS))
-        msg += ", <=" + str(DRIFT_MAX_RUNNERS) + " runners, "
+        if DRIFT_MAX_RUNNERS >= 999:
+            msg += ", any field size, "
+        else:
+            msg += ", <=" + str(DRIFT_MAX_RUNNERS) + " runners, "
         msg += str(int(DRIFT_WINDOW_START / 60)) + "-" + str(int(DRIFT_WINDOW_END / 60))
-        msg += " min out, " + str(DRIFT_MAX_PRICE) + " or shorter, drifts "
-        msg += "+" + str(DRIFT_RISE) + " or more"
+        msg += " min out, price " + str(DRIFT_MIN_PRICE) + "-" + str(DRIFT_MAX_PRICE)
+        msg += ", drifts +" + str(DRIFT_RISE) + " or more"
     else:
         msg += "S2 drift: disabled"
     send_telegram(msg)
